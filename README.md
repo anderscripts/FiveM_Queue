@@ -20,7 +20,7 @@ A Queue system for FiveM FX Servers
 - Queue admin commands (In-Game, RCON, or console)
 - Queue admin UI panel in game to configure queue and session players
 - Queue admins are permissioned in configuration.cfg by steam or license
-- Customizable options and permissions included in configuration.cfg (Defaults incldued)
+- Customizable options and permissions included in configuration.cfg (Defaults included)
 
 <b>Requirements</b>
 - Steam and License are required for features and persistence
