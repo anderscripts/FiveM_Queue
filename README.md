@@ -2,11 +2,11 @@
 A Queue system for FiveM FX Servers
 
 <b>Installation Instructions</b>
-- Download the latest release <a href="#">here</a>
+- Download the latest release <a href="https://github.com/anderscripts/FiveM_Queue/releases/download/1.0/fivemqueue.rar">here</a>
 - Copy fivemqueue folder into your FX Server resources folder
 - edit configuration.cfg too add identifier for your Queue Admin(s)
 - start fivemqueue in your server.cfg like any other resource
-- Enjoy and please report any bugs <a href="https://github.com/anderscripts/FiveM-Queue/issues">here</a>
+- Enjoy and please report any bugs <a href="https://github.com/anderscripts/FiveM_Queue/issues">here</a>
 
 <b>Features</b>
 - Add or remove queue priority to players
