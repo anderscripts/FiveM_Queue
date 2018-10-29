@@ -1,10 +1,6 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
 using System.Threading.Tasks;
-using System.Dynamic;
-using Newtonsoft.Json;
+using System.Collections.Generic;
 using CitizenFX.Core;
 using CitizenFX.Core.Native;
 
@@ -26,6 +22,7 @@ namespace Client_Queue
                     await Delay(1000);
                 }
                 TriggerServerEvent("fivemqueue: playerConnected");
+                API.SendNuiMessage($@"{{ ""resname"" : ""{API.GetCurrentResourceName()}"" }}");
                 Tick -= Connected;
             }
             catch (Exception)

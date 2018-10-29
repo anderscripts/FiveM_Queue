@@ -1,82 +1,627 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Dynamic;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Threading.Tasks;
+using System.Collections.Concurrent;
+using System.Dynamic;
+using Newtonsoft.Json;
 using CitizenFX.Core;
 using CitizenFX.Core.Native;
-using Newtonsoft.Json;
-using System.Net;
 
-namespace Server_Queue
+namespace Server
 {
     public class Server_Queue : BaseScript
     {
         internal static string resourceName = API.GetCurrentResourceName();
-        private static readonly string jsonRoot = $"resources/{resourceName}/JSON";
-        private static readonly string fileSession = $"{jsonRoot}/session.json";
-        private static string jsonSession;
-        internal static List<SessionAccount> sessionAccounts = new List<SessionAccount>();
-        private static Queue<SessionAccount> newSessions = new Queue<SessionAccount>();
-        private static Queue<SessionAccount> droppedSessions = new Queue<SessionAccount>();
-        private static Queue<SessionAccount> activeSessions = new Queue<SessionAccount>();
-        private static int maxSessions;
-        private static int loadTimeLimit;
-        private static int graceTimeLimit;
-        private static int reservedTypeOneSlots;
-        private static int reservedTypeTwoSlots;
-        private static int reservedTypeThreeSlots;
-        private static bool whitelistonly;
-        private static int dots = 3;
-        private static bool ready = false;
+        private ConcurrentQueue<string> queue = new ConcurrentQueue<string>();
+        private ConcurrentQueue<string> newQueue = new ConcurrentQueue<string>();
+        private ConcurrentQueue<string> pQueue = new ConcurrentQueue<string>();
+        private ConcurrentQueue<string> newPQueue = new ConcurrentQueue<string>();
+        private Dictionary<string, string> messages = new Dictionary<string, string>();
+        private ConcurrentDictionary<string, SessionState> session = new ConcurrentDictionary<string, SessionState>();
+        private ConcurrentDictionary<string, int> index = new ConcurrentDictionary<string, int>();
+        private ConcurrentDictionary<string, DateTime> timer = new ConcurrentDictionary<string, DateTime>();
+        private ConcurrentDictionary<string, Player> sentLoading = new ConcurrentDictionary<string, Player>();
+        internal static ConcurrentDictionary<string, int> priority = new ConcurrentDictionary<string, int>();
+        internal static ConcurrentDictionary<string, Reserved> reserved = new ConcurrentDictionary<string, Reserved>();
+        internal static ConcurrentDictionary<string, Reserved> slotTaken = new ConcurrentDictionary<string, Reserved>();
+        
+        private bool queueCycleComplete = false;
+        private int maxSession = 32;
+        private int reservedTypeOneSlots = 0;
+        private int reservedTypeTwoSlots = 0;
+        private int reservedTypeThreeSlots = 0;
+        private int publicTypeSlots = 0;
+        private double queueGraceTime = 1;
+        private double graceTime = 2;
+        private double loadTime = 2;
+        private int inQueue = 0;
+        private int inPriorityQueue = 0;
+        private string hostName = string.Empty;
+        private int lastCount = 0;
+        private bool whitelistonly = false;
+        private bool serverQueueReady = false;
+        internal static bool bannedReady = false;
+        internal static bool reservedReady = false;
+        internal static bool priorityReady = false;
+
+        private int testsubjects = 0;
 
         public Server_Queue()
         {
-            try
-            {
-                GetConfig();
-                if (reservedTypeOneSlots + reservedTypeTwoSlots + reservedTypeThreeSlots > maxSessions)
-                {
-                    Debug.WriteLine($"\n\n{new string('#', 50)}\n[{resourceName} CONFIGURATION : FATAL] - Error in configuration.cfg\nSum of all reserved slot types (Current: {reservedTypeOneSlots + reservedTypeTwoSlots + reservedTypeThreeSlots}) must be less than or equal to max sessions (Current: {maxSessions}).\n{resourceName} will not start. Fix configuration.cfg and restart server\n{new string('#', 50)}\n\n");
-                    return;
-                }
-                EventHandlers["playerConnecting"] += new Action<Player, string, CallbackDelegate, ExpandoObject>(PlayerConnecting);
-                EventHandlers["playerDropped"] += new Action<Player, string>(PlayerDropped);
-                EventHandlers["fivemqueue: playerConnected"] += new Action<Player>(PlayerActivated);
-                API.RegisterCommand("q_restart", new Action<int, List<object>, string>(QueueRestart), true);
-                API.RegisterCommand("q_session", new Action<int, List<object>, string>(QueueSession), true);
-                API.RegisterCommand("exitgame", new Action<int, List<object>, string>(ExitSession), false);
-                Server_Banned.Start();
-                Server_Priority.Start();
-                Server_Reserved.Start();
-                CreateSession(fileSession);
-                StopHardcap();
-                Tick += SessionProcessing;
-                ready = true;
-            }
-            catch (Exception)
-            {
-                Debug.WriteLine($"[{resourceName} - FATAL ERROR] - Server_Queue()");
-            }
+            LoadConfigs();
+            EventHandlers["onResourceStop"] += new Action<string>(OnResourceStop);
+            EventHandlers["playerConnecting"] += new Action<Player, string, CallbackDelegate, ExpandoObject>(PlayerConnecting);
+            EventHandlers["playerDropped"] += new Action<Player, string>(PlayerDropped);
+            EventHandlers["fivemqueue: playerConnected"] += new Action<Player>(PlayerActivated);
+            API.RegisterCommand("q_session", new Action<int, List<object>, string>(QueueSession), true);
+            API.RegisterCommand("q_changemax", new Action<int, List<object>, string>(QueueChangeMax), true);
+            API.RegisterCommand("q_reloadconfig", new Action<int, List<object>, string>(ReloadConfig), true);
+            API.RegisterCommand("q_kick", new Action<int, List<object>, string>(Kick), true);
+            API.RegisterCommand("q_steamhexfromprofile", new Action<int, List<object>, string>(SteamProfileToHex), true);
+            API.RegisterCommand("exitgame", new Action<int, List<object>, string>(ExitSession), false);
+            API.RegisterCommand("q_count", new Action<int, List<object>, string>(QueueCheck), false);
+            StopHardcap();
+            Task.Run(QueueCycle);
+            serverQueueReady = true;
         }
 
-        private void GetConfig()
+        private void LoadConfigs()
+        {
+            API.ExecuteCommand($"exec resources/{resourceName}/__configuration.cfg");
+            if (hostName == string.Empty) { hostName = API.GetConvar("sv_hostname", string.Empty); }
+            string path = $"resources/{resourceName}/__messages.json";
+            if (!File.Exists(path)) { CreateMessagesJSON(path); }
+            else { messages = JsonConvert.DeserializeObject<Dictionary<string, string>>(File.ReadAllText(path)); }
+            maxSession = API.GetConvarInt("q_max_session_slots", 32);
+            if (maxSession > 32) { maxSession = 32; }
+            API.ExecuteCommand($"sv_maxclients {maxSession}");
+            loadTime = API.GetConvarInt("q_loading_time_limit", 2);
+            graceTime = API.GetConvarInt("q_reconnect_grace_time_limit", 2);
+            queueGraceTime = API.GetConvarInt("q_queue_cancel_grace_time_limit", 1);
+            reservedTypeOneSlots = API.GetConvarInt("q_reserved_type_1_slots", 0);
+            reservedTypeTwoSlots = API.GetConvarInt("q_reserved_type_2_slots", 0);
+            reservedTypeThreeSlots = API.GetConvarInt("q_reserved_type_3_slots", 0);
+            publicTypeSlots = maxSession - reservedTypeOneSlots - reservedTypeTwoSlots - reservedTypeThreeSlots;
+            whitelistonly = API.GetConvar("q_whitelist_only", "false") == "true";
+        }
+
+        private void QueueCheck(int source, List<object> args, string raw)
+        {
+            Debug.WriteLine($"Queue: {queue.Count}");
+            Debug.WriteLine($"Priority Queue: {pQueue.Count}");
+            session.Where(k => k.Value == SessionState.Queue).ToList().ForEach(j => 
+            {
+                Debug.WriteLine($"{j.Key} is in queue. Timer: {timer.TryGetValue(j.Key, out DateTime oldTimer)} Priority: {priority.TryGetValue(j.Key, out int oldPriority)}");
+            });
+        }
+
+        private void ReloadConfig(int source, List<object> args, string raw)
+        {
+            LoadConfigs();
+        }
+
+        private void CreateMessagesJSON(string path)
+        {
+            messages.Add("Gathering","Gathering queue information");
+            messages.Add("License","License is required");
+            messages.Add("Steam","Steam is required");
+            messages.Add("Banned","You are banned");
+            messages.Add("Whitelist","You are not whitelisted");
+            messages.Add("Queue","You are in queue");
+            messages.Add("PriorityQueue","You are in priority queue");
+            messages.Add("Canceled","Canceled from queue");
+            messages.Add("Error","An error prevented deferrals");
+            messages.Add("Timeout","Timed Out");
+            messages.Add("QueueCount", "[Queue: {0}]");
+            File.WriteAllText(path, JsonConvert.SerializeObject(messages, Formatting.Indented));
+        }
+
+        private bool IsEverythingReady()
+        {
+            if (serverQueueReady && bannedReady && priorityReady && reservedReady)
+            { return true; }
+            return false;
+        }
+
+        private void ExitSession(int source, List<object> args, string raw)
         {
             try
             {
-                API.ExecuteCommand($"exec resources/{resourceName}/__configuration.cfg");
-                maxSessions = API.GetConvarInt("q_max_session_slots", 32);
-                loadTimeLimit = API.GetConvarInt("q_loading_time_limit", 5);
-                graceTimeLimit = API.GetConvarInt("q_reconnect_grace_time_limit", 5);
-                reservedTypeOneSlots = API.GetConvarInt("q_reserved_type_1_slots", 0);
-                reservedTypeTwoSlots = API.GetConvarInt("q_reserved_type_2_slots", 0);
-                reservedTypeThreeSlots = API.GetConvarInt("q_reserved_type_3_slots", 0);
-                whitelistonly = API.GetConvar("q_whitelist_only", "false") == "true";
+                if (source == 0)
+                {
+                    Debug.WriteLine($"This is not a console command");
+                    return;
+                }
+                else
+                {
+                    Player player = Players.FirstOrDefault(k => k.Handle == source.ToString());
+                    RemoveFrom(player.Identifiers["license"], true, true, true, true, true, true);
+                    player.Drop("Exited");
+                }
             }
             catch (Exception)
             {
-                Debug.WriteLine($"[{resourceName} - ERROR] - GetConfig()");
+                Debug.WriteLine($"[{resourceName} - ERROR] - ExitSession()");
+            }
+        }
+
+        private void Kick(int source, List<object> args, string raw)
+        {
+            try
+            {
+                if (args.Count != 1)
+                {
+                    Debug.WriteLine($"This command requires one arguement. <Steam> OR <License>");
+                    return;
+                }
+                string identifier = args[0].ToString();
+                Player player = Players.FirstOrDefault(k => k.Identifiers["license"] == identifier || k.Identifiers["steam"] == identifier);
+                if (player == null)
+                {
+                    Debug.WriteLine($"No matching account in session for {identifier}, use session command to get an identifier.");
+                    return;
+                }
+                RemoveFrom(player.Identifiers["license"], true, true, true, true, true, true);
+                player.Drop("Kicked");
+                Debug.WriteLine($"{identifier} was kicked.");
+            }
+            catch (Exception)
+            {
+                Debug.WriteLine($"[{resourceName} - ERROR] - Kick()");
+            }
+        }
+
+        private void UpdateHostName()
+        {
+            try
+            {
+                string concat = hostName;
+                int count = inQueue + inPriorityQueue;
+                if (API.GetConvar("q_add_queue_count_before_server_name", "false") == "true")
+                {
+                    if (count > 0) { concat = string.Format($"{messages["QueueCount"]} {concat}", count); }
+                    else { concat = hostName; }
+                }
+                if (API.GetConvar("q_add_queue_count_after_server_name", "false") == "true")
+                {
+                    if (count > 0) { concat = string.Format($"{concat} {messages["QueueCount"]}", count); }
+                    else { concat = hostName; }
+                }
+                if (lastCount != count)
+                {
+                    API.SetConvar("sv_hostname", concat);
+                }
+                lastCount = count;
+            }
+            catch (Exception)
+            {
+                Debug.WriteLine($"[{resourceName} - ERROR] - UpdateHostName()");
+            }
+        }
+
+        private int QueueCount()
+        {
+            try
+            {
+                int place = 0;
+                ConcurrentQueue<string> temp = new ConcurrentQueue<string>();
+                while (!queue.IsEmpty)
+                {
+                    queue.TryDequeue(out string license);
+                    if (IsTimeUp(license, queueGraceTime))
+                    {
+                        RemoveFrom(license, true, true, true, true, true, true);
+                        Debug.WriteLine($"Removed canceled player from queue {license}");
+                        continue;
+                    }
+                    if (priority.TryGetValue(license, out int priorityAdded))
+                    {
+                        newPQueue.Enqueue(license);
+                        continue;
+                    }
+                    if (!Loading(license))
+                    {
+                        place += 1;
+                        UpdatePlace(license, place);
+                        temp.Enqueue(license);
+                    }
+                }
+                while (!newQueue.IsEmpty)
+                {
+                    newQueue.TryDequeue(out string license);
+                    if (!Loading(license))
+                    {
+                        place += 1;
+                        UpdatePlace(license, place);
+                        temp.Enqueue(license);
+                    }
+                }
+                queue = temp;
+                return queue.Count;
+            }
+            catch(Exception)
+            {
+                Debug.WriteLine($"[{resourceName} - ERROR] - QueueCount()"); return queue.Count;
+            }
+        }
+
+        private int PriorityQueueCount()
+        {
+            try
+            {
+                List<KeyValuePair<string, int>> order = new List<KeyValuePair<string, int>>();
+                while (!pQueue.IsEmpty)
+                {
+                    pQueue.TryDequeue(out string license);
+                    if (IsTimeUp(license, queueGraceTime))
+                    {
+                        RemoveFrom(license, true, true, true, true, true, true);
+                        Debug.WriteLine($"Removed canceled player from priority queue {license}");
+                        continue;
+                    }
+                    if(!priority.TryGetValue(license, out int priorityNum))
+                    {
+                        newQueue.Enqueue(license);
+                        continue;
+                    }
+                    order.Insert(order.FindLastIndex(k => k.Value <= priorityNum) + 1, new KeyValuePair<string, int>(license, priorityNum));
+                }
+                while (!newPQueue.IsEmpty)
+                {
+                    newPQueue.TryDequeue(out string license);
+                    priority.TryGetValue(license, out int priorityNum);
+                    order.Insert(order.FindLastIndex(k => k.Value >= priorityNum) + 1, new KeyValuePair<string, int>(license, priorityNum));
+                }
+                int place = 0;
+                order.ForEach(k =>
+                {
+                    if (!Loading(k.Key))
+                    {
+                        place += 1;
+                        UpdatePlace(k.Key, place);
+                        pQueue.Enqueue(k.Key);
+                    }
+                });
+                return pQueue.Count;
+            }
+            catch(Exception)
+            {
+                Debug.WriteLine($"[{resourceName} - ERROR] - PriorityQueueCount()"); return pQueue.Count;
+            }
+        }
+
+        private bool Loading(string license)
+        {
+            try
+            {
+                if (reserved.ContainsKey(license) && reserved[license] == Reserved.Reserved1 && slotTaken.Count(j => j.Value == Reserved.Reserved1) < reservedTypeOneSlots)
+                { NewLoading(license, Reserved.Reserved1); return true; }
+                else if (reserved.ContainsKey(license) && (reserved[license] == Reserved.Reserved1 || reserved[license] == Reserved.Reserved2) && slotTaken.Count(j => j.Value == Reserved.Reserved2) < reservedTypeTwoSlots)
+                { NewLoading(license, Reserved.Reserved2); return true; }
+                else if (reserved.ContainsKey(license) && (reserved[license] == Reserved.Reserved1 || reserved[license] == Reserved.Reserved2 || reserved[license] == Reserved.Reserved3) && slotTaken.Count(j => j.Value == Reserved.Reserved3) < reservedTypeThreeSlots)
+                { NewLoading(license, Reserved.Reserved3); return true; }
+                else if (session.Count(j => j.Value != SessionState.Queue) - slotTaken.Count(i => i.Value != Reserved.Public) < publicTypeSlots)
+                { NewLoading(license, Reserved.Public); return true; }
+                else { return false; }
+            }
+            catch(Exception)
+            {
+                Debug.WriteLine($"[{resourceName} - ERROR] - CanLoad()"); return false;
+            }
+        }
+
+        private void BalanceReserved()
+        {
+            try
+            {
+                var query = from license in session
+                            join license2 in reserved on license.Key equals license2.Key
+                            join license3 in slotTaken on license.Key equals license3.Key
+                            where license.Value == SessionState.Active && license2.Value != license3.Value
+                            select new { license.Key, license2.Value };
+
+                query.ToList().ForEach(k =>
+                {
+                    int openReservedTypeOneSlots = reservedTypeOneSlots - slotTaken.Count(j => j.Value == Reserved.Reserved1);
+                    int openReservedTypeTwoSlots = reservedTypeTwoSlots - slotTaken.Count(j => j.Value == Reserved.Reserved2);
+                    int openReservedTypeThreeSlots = reservedTypeThreeSlots - slotTaken.Count(j => j.Value == Reserved.Reserved3);
+
+                    switch (k.Value)
+                    {
+                        case Reserved.Reserved1:
+                            if (openReservedTypeOneSlots > 0)
+                            {
+                                if (!slotTaken.TryAdd(k.Key, Reserved.Reserved1))
+                                {
+                                    slotTaken.TryGetValue(k.Key, out Reserved oldReserved);
+                                    slotTaken.TryUpdate(k.Key, Reserved.Reserved1, oldReserved);
+                                }
+                                Debug.WriteLine($"Assigned {k.Key} to Reserved1");
+                            }
+                            else if (openReservedTypeTwoSlots > 0)
+                            {
+                                if (!slotTaken.TryAdd(k.Key, Reserved.Reserved2))
+                                {
+                                    slotTaken.TryGetValue(k.Key, out Reserved oldReserved);
+                                    slotTaken.TryUpdate(k.Key, Reserved.Reserved2, oldReserved);
+                                }
+                                Debug.WriteLine($"Assigned {k.Key} to Reserved2");
+                            }
+                            else if (openReservedTypeThreeSlots > 0)
+                            {
+                                if (!slotTaken.TryAdd(k.Key, Reserved.Reserved3))
+                                {
+                                    slotTaken.TryGetValue(k.Key, out Reserved oldReserved);
+                                    slotTaken.TryUpdate(k.Key, Reserved.Reserved3, oldReserved);
+                                }
+                                Debug.WriteLine($"Assigned {k.Key} to Reserved3");
+                            }
+                            break;
+
+                        case Reserved.Reserved2:
+                            if (openReservedTypeTwoSlots > 0)
+                            {
+                                if (!slotTaken.TryAdd(k.Key, Reserved.Reserved2))
+                                {
+                                    slotTaken.TryGetValue(k.Key, out Reserved oldReserved);
+                                    slotTaken.TryUpdate(k.Key, Reserved.Reserved2, oldReserved);
+                                }
+                                Debug.WriteLine($"Assigned {k.Key} to Reserved2");
+                            }
+                            else if (openReservedTypeThreeSlots > 0)
+                            {
+                                if (!slotTaken.TryAdd(k.Key, Reserved.Reserved3))
+                                {
+                                    slotTaken.TryGetValue(k.Key, out Reserved oldReserved);
+                                    slotTaken.TryUpdate(k.Key, Reserved.Reserved3, oldReserved);
+                                }
+                                Debug.WriteLine($"Assigned {k.Key} to Reserved3");
+                            }
+                            break;
+
+                        case Reserved.Reserved3:
+                            if (openReservedTypeThreeSlots > 0)
+                            {
+                                if (!slotTaken.TryAdd(k.Key, Reserved.Reserved3))
+                                {
+                                    slotTaken.TryGetValue(k.Key, out Reserved oldReserved);
+                                    slotTaken.TryUpdate(k.Key, Reserved.Reserved3, oldReserved);
+                                }
+                                Debug.WriteLine($"Assigned {k.Key} to Reserved3");
+                            }
+                            break;
+                    }
+                });
+            }
+            catch (Exception) { Debug.WriteLine($"[{resourceName} - ERROR] - BalanceReserved()"); }
+        }
+
+        private void NewLoading(string license, Reserved slotType)
+        {
+            try
+            {
+                if (session.TryGetValue(license, out SessionState oldState))
+                {
+                    UpdateTimer(license);
+                    RemoveFrom(license, false, true, false, false, false, false);
+                    if (!slotTaken.TryAdd(license, slotType))
+                    {
+                        slotTaken.TryGetValue(license, out Reserved oldSlotType);
+                        slotTaken.TryUpdate(license, slotType, oldSlotType);
+                    }
+                    session.TryUpdate(license, SessionState.Loading, oldState);
+                    Debug.WriteLine($"[{resourceName}]: QUEUE -> LOADING -> ({Enum.GetName(typeof(Reserved), slotType)}) {license}");
+                }
+            }
+            catch(Exception)
+            {
+                Debug.WriteLine($"[{resourceName} - ERROR] - NewLoading()");
+            }
+        }
+
+        private bool IsTimeUp(string license, double time)
+        {
+            try
+            {
+                if (!timer.ContainsKey(license)) { return false; }
+                return timer[license].AddMinutes(time) < DateTime.UtcNow;
+            }
+            catch(Exception)
+            {
+                Debug.WriteLine($"[{resourceName} - ERROR] - IsTimeUp()"); return false;
+            }
+        }
+
+        private void UpdatePlace(string license, int place)
+        {
+            try
+            {
+                if (!index.TryAdd(license, place))
+                {
+                    index.TryGetValue(license, out int oldPlace);
+                    index.TryUpdate(license, place, oldPlace);
+                }
+            }
+            catch(Exception)
+            {
+                Debug.WriteLine($"[{resourceName} - ERROR] - UpdatePlace()");
+            }
+        }
+
+        private void UpdateTimer(string license)
+        {
+            try
+            {
+                if (!timer.TryAdd(license, DateTime.UtcNow))
+                {
+                    timer.TryGetValue(license, out DateTime oldTime);
+                    timer.TryUpdate(license, DateTime.UtcNow, oldTime);
+                }
+            }
+            catch(Exception)
+            {
+                Debug.WriteLine($"[{resourceName} - ERROR] - UpdateTimer()");
+            }
+        }
+
+        private void UpdateStates()
+        {
+            try
+            {
+                session.Where(k => k.Value == SessionState.Loading || k.Value == SessionState.Grace).ToList().ForEach(j =>
+                {
+                    string license = j.Key;
+                    SessionState state = j.Value;
+                    switch (state)
+                    {
+                        case SessionState.Loading:
+                            if (!timer.TryGetValue(license, out DateTime oldLoadTime))
+                            {
+                                UpdateTimer(license);
+                                break;
+                            }
+                            if (IsTimeUp(license, loadTime))
+                            {
+                                if (Players.FirstOrDefault(i => i.Identifiers["license"] == license)?.EndPoint != null)
+                                {
+                                    Players.FirstOrDefault(i => i.Identifiers["license"] == license).Drop($"{messages["Timeout"]}");
+                                }
+                                session.TryGetValue(license, out SessionState oldState);
+                                session.TryUpdate(license, SessionState.Grace, oldState);
+                                UpdateTimer(license);
+                                Debug.WriteLine($"[{resourceName}]: LOADING -> GRACE -> {license}");
+                            }
+                            else
+                            {
+                                if (sentLoading.ContainsKey(license) && Players.FirstOrDefault(i => i.Identifiers["license"] == license) != null)
+                                {
+                                    TriggerEvent("fivemqueue: newloading", sentLoading[license]);
+                                    sentLoading.TryRemove(license, out Player oldPlayer);
+                                }
+                            }
+                            break;
+                        case SessionState.Grace:
+                            if (!timer.TryGetValue(license, out DateTime oldGraceTime))
+                            {
+                                UpdateTimer(license);
+                                break;
+                            }
+                            if (IsTimeUp(license, graceTime))
+                            {
+                                if (Players.FirstOrDefault(i => i.Identifiers["license"] == license)?.EndPoint != null)
+                                {
+                                    if (!session.TryAdd(license, SessionState.Active))
+                                    {
+                                        session.TryGetValue(license, out SessionState oldState);
+                                        session.TryUpdate(license, SessionState.Active, oldState);
+                                    }
+                                }
+                                else
+                                {
+                                    RemoveFrom(license, true, true, true, true, true, true);
+                                    Debug.WriteLine($"[{resourceName}]: GRACE -> REMOVED -> {license}");
+                                }
+                            }
+                            break;
+                    }
+                });
+            }
+            catch(Exception)
+            {
+                Debug.WriteLine($"[{resourceName} - ERROR] - UpdateStates()");
+            }
+        }
+
+        private void RemoveFrom(string license, bool doSession, bool doIndex, bool doTimer, bool doPriority, bool doReserved, bool doSlot)
+        {
+            try
+            {
+                if (doSession) { session.TryRemove(license, out SessionState oldState); }
+                if (doIndex) { index.TryRemove(license, out int oldPosition); }
+                if (doTimer) { timer.TryRemove(license, out DateTime oldTime); }
+                if (doPriority) { priority.TryRemove(license, out int oldPriority); }
+                if (doReserved) { reserved.TryRemove(license, out Reserved oldReserved); }
+                if (doSlot) { slotTaken.TryRemove(license, out Reserved oldSlot); }
+            }
+            catch(Exception)
+            {
+                Debug.WriteLine($"[{resourceName} - ERROR] - RemoveFrom()");
+            }
+        }
+
+        private async void QueueSession(int source, List<object> args, string raw)
+        {
+            try
+            {
+                if (args.Count != 0)
+                {
+                    Debug.WriteLine($"This command takes no arguments.");
+                    return;
+                }
+                if (session.Count == 0)
+                {
+                    Debug.WriteLine($"No accounts in session");
+                    return;
+                }
+                if (source == 0)
+                {
+                    Debug.WriteLine($"| LICENSE | STATE | STEAM | PRIORITY | RESERVE | SLOT USED | HANDLE | NAME | ");
+                    session.OrderByDescending(k => k.Value).ToList().ForEach(j =>
+                    {
+                        Player player = Players.FirstOrDefault(i => i.Identifiers["license"] == j.Key);
+                        if (player == null)
+                        { sentLoading.TryGetValue(j.Key, out player); }
+                        if (!priority.TryGetValue(j.Key, out int oldPriority)) { oldPriority = 0; }
+                        if (!reserved.TryGetValue(j.Key, out Reserved oldReserved)) { oldReserved = Reserved.Public; }
+                        if (!slotTaken.TryGetValue(j.Key, out Reserved oldSlot)) { oldSlot = Reserved.Public; }
+                        Debug.WriteLine($"| {j.Key} | {j.Value} | {player?.Identifiers["steam"]} | {oldPriority} | {oldReserved} | {oldSlot} | {player?.Handle} | {player?.Name} |");
+                    });
+                }
+                else
+                {
+                    List<dynamic> sessionReturn = new List<dynamic>();
+                    session.OrderByDescending(k => k.Value).ToList().ForEach(j =>
+                    {
+                        dynamic temp;
+                        Player player = Players.FirstOrDefault(i => i.Identifiers["license"] == j.Key);
+                        if (player == null)
+                        { sentLoading.TryGetValue(j.Key, out player); }
+                        if (!priority.TryGetValue(j.Key, out int oldPriority)) { oldPriority = 0; }
+                        if (!reserved.TryGetValue(j.Key, out Reserved oldReserved)) { oldReserved = Reserved.Public; }
+                        if (!slotTaken.TryGetValue(j.Key, out Reserved oldSlot)) { oldSlot = Reserved.Public; }
+                        temp = new { License = j.Key, State = j.Value, Steam = player?.Identifiers["steam"], Priority = oldPriority, Reserved = oldReserved, ReservedUsed = oldSlot, Handle = player?.Handle, Name = player?.Name };
+                        sessionReturn.Add(temp);
+                    });
+                    Player requested = Players.FirstOrDefault(k => k.Handle == source.ToString());
+                    requested.TriggerEvent("fivemqueue: sessionResponse", JsonConvert.SerializeObject(sessionReturn));
+                }
+            }
+            catch (Exception)
+            {
+                Debug.WriteLine($"[{resourceName} - ERROR] - QueueSession()");
+            }
+            await Delay(0);
+        }
+
+        private async void QueueChangeMax(int source, List<object> args, string raw)
+        {
+            try
+            {
+                if (args.Count != 1) { Debug.WriteLine($"Command needs 1 argument. Example: changemax 32"); return; }
+                int newMax = int.Parse(args[0].ToString());
+                if (newMax <= 0 || newMax > 32) { Debug.WriteLine($"changemax must be between 1 and 32"); return; }
+                while (!queueCycleComplete)
+                {
+                    await Delay(0);
+                }
+                maxSession = newMax;
+            }
+            catch(Exception)
+            {
+                Debug.WriteLine($"[{resourceName} - ERROR] - QueueChangeMax()");
             }
         }
 
@@ -84,6 +629,7 @@ namespace Server_Queue
         {
             try
             {
+                API.ExecuteCommand($"sets fivemqueue Enabled");
                 int attempts = 0;
                 while (attempts < 7)
                 {
@@ -107,769 +653,288 @@ namespace Server_Queue
             }
         }
 
-        private async void QueueRestart(int source, List<object> args, string raw)
+        private void OnResourceStop(string name)
         {
             try
             {
-                if (args.Count() != 0)
+                if (name == resourceName)
                 {
-                    Debug.WriteLine($"This command takes no arguments.");
-                    return;
+                    if (API.GetResourceState("hardcap") != "started")
+                    {
+                        API.StartResource("hardcap");
+                        API.ExecuteCommand($"sets fivemqueue Disabled");
+                    }
+                    API.SetConvar("sv_hostname", hostName);
                 }
-                Tick -= SessionProcessing;
-                await Delay(1000);
-                Tick += SessionProcessing;
-                await Delay(1000);
-                Debug.WriteLine("Restart complete.");
             }
             catch (Exception)
             {
-                Debug.WriteLine($"[{resourceName} - ERROR] - QueueRestart()");
+                Debug.WriteLine($"[{resourceName} - ERROR] - OnResourceStop()");
             }
         }
 
-        private async void QueueSession(int source, List<object> args, string raw)
+        private void PlayerDropped([FromSource] Player source, string message)
         {
             try
             {
-                if (args.Count != 0)
-                {
-                    Debug.WriteLine($"This command takes no arguments.");
-                    return;
-                }
-                if (sessionAccounts.Count() == 0)
-                {
-                    Debug.WriteLine($"No accounts in session");
-                    return;
-                }
-            }
-            catch (Exception)
-            {
-                Debug.WriteLine($"[{resourceName} - ERROR] - QueueSession()");
-            }
-            try
-            {
-                Player player = Players.FirstOrDefault(k => k.Handle == source.ToString());
-                player.TriggerEvent("FivemQueue: sessionResponse", JsonConvert.SerializeObject(sessionAccounts));
-            }
-            catch (Exception)
-            {
-                Debug.WriteLine($"| HANDLE | LICENSE | STEAM | NAME | RESERVED | RESERVED USED | PRIORITY | STATE |");
-                sessionAccounts.ForEach(k =>
-                {
-                    Debug.WriteLine($"| {k.Handle} | {k.License} | {k.Steam} | {k.Name} | {Enum.GetName(typeof(Reserved), k.ReservedType)} | {Enum.GetName(typeof(Reserved), k.ReservedTypeUsed)} | {k.HasPriority} | {Enum.GetName(typeof(SessionState), k.State)} |");
-                });
-            }
-            await Delay(1000);
-        }
-
-        private async void ExitSession(int source, List<object> args, string raw)
-        {
-            try
-            {
-                if (source == 0)
-                {
-                    Debug.WriteLine($"This is not a console command");
-                    return;
-                }
-                else
-                {
-                    Player player = Players.FirstOrDefault(k => k.Handle == source.ToString());
-                    player.Drop("Exited");
-                }
-            }
-            catch (Exception)
-            {
-                Debug.WriteLine($"[{resourceName} - ERROR] - ExitSession()");
-            }
-            await Delay(1000);
-        }
-
-        private void CreateSession(string session)
-        {
-            try
-            {
-                if (!Directory.Exists(jsonRoot))
-                {
-                    Directory.CreateDirectory(jsonRoot);
-                }
-                if (!File.Exists(session))
-                {
-                    File.WriteAllText(session, JsonConvert.SerializeObject(sessionAccounts));
-                }
-                jsonSession = File.ReadAllText(session);
-                sessionAccounts = JsonConvert.DeserializeObject<List<SessionAccount>>(jsonSession);
-            }
-            catch (Exception)
-            {
-                Debug.WriteLine($"[{resourceName} - ERROR] - CreateSession()");
-            }
-            try
-            { 
-            if (sessionAccounts.Count() > 0)
-                {
-                    sessionAccounts.ForEach(k =>
-                    {
-                        if (k.State == SessionState.Banned || k.State == SessionState.Exiting)
-                        {
-                            sessionAccounts.Remove(k);
-                        }
-                        else if (!k.IsQueued)
-                        {
-                            k.State = SessionState.Grace;
-                            k.DropStartTime = DateTime.UtcNow;
-                        }
-                        else
-                        {
-                            k.State = SessionState.QueueGrace;
-                            k.DropStartTime = DateTime.UtcNow;
-                        }
-                    });
-                    sessionAccounts = sessionAccounts.OrderBy(k => k.State).ThenBy(k => k.QueueStartTime).ToList();
-                    jsonSession = JsonConvert.SerializeObject(sessionAccounts);
-                    File.WriteAllText(fileSession, jsonSession);
-                }
-            }
-            catch (Exception)
-            {
-                Debug.WriteLine($"[{resourceName} - ERROR] - CreateSession() - Restore");
-            }
-        }
-
-        private async Task SessionProcessing()
-        {
-            try
-            {
-                sessionAccounts.Where(k => k.State == SessionState.Queue && !k.IsConnected).ToList().ForEach(k =>
-                {
-                    k.DropStartTime = DateTime.UtcNow;
-                    k.State = SessionState.QueueGrace;
-                });
-            }
-            catch (Exception)
-            {
-                Debug.WriteLine($"[{resourceName} - ERROR] - SessionProcessing() - Queue Grace");
-            }
-            try
-            {
-                sessionAccounts.Where(k => k.State == SessionState.Loading && k.LoadStartTime.AddMinutes(loadTimeLimit) < DateTime.UtcNow).ToList().ForEach(k =>
-                {
-                    Function.Call(Hash.DROP_PLAYER, k.Handle, "Froze during game load");
-                });
-            }
-            catch (Exception)
-            {
-                Debug.WriteLine($"[{resourceName} - ERROR] - SessionProcessing() - Drop Frozen Loading");
-            }
-            try
-            {
-                while (droppedSessions.Count > 0)
-                {
-                    SessionAccount droppedAccount = droppedSessions.Dequeue();
-                    SessionAccount account = sessionAccounts.Find(k => k.License == droppedAccount.License && k.Steam == droppedAccount.Steam);
-                    if (account != null)
-                    {
-                        if (!account.IsQueued)
-                        {
-                            account.State = SessionState.Grace;
-                            continue;
-                        }
-                        account.State = SessionState.QueueGrace;
-                        continue;
-                    }
-                    Debug.WriteLine($"[{resourceName} PROCESSING : WARNING] - Dropped Account Does Not Exist In Session : {droppedAccount.Steam} : {droppedAccount.License} : {droppedAccount.Name}");
-                }
-            }
-            catch (Exception)
-            {
-                Debug.WriteLine($"[{resourceName} - ERROR] - SessionProcessing() - Handle Dropped Sessions");
-            }
-            try
-            {
-                while (activeSessions.Count > 0)
-                {
-                    SessionAccount activeAccount = activeSessions.Dequeue();
-                    SessionAccount account = sessionAccounts.Find(k => k.License == activeAccount.License && k.Steam == activeAccount.Steam);
-                    if (account != null)
-                    {
-                        account.Handle = activeAccount.Handle;
-                        account.State = SessionState.Active;
-                        continue;
-                    }
-                    Debug.WriteLine($"[{resourceName} PROCESSING : WARNING] - Active Account Does Not Exist In Session : {activeAccount.Steam} : {activeAccount.License} : {activeAccount.Name}");
-                    Function.Call(Hash.DROP_PLAYER, activeAccount.Handle, "No Session Account Exists.");
-                }
-            }
-            catch (Exception)
-            {
-                Debug.WriteLine($"[{resourceName} - ERROR] - SessionProcessing() - Handle Activated Sessions");
-            }
-            try
-            {
-                while (newSessions.Count > 0)
-                {
-                    SessionAccount newAccount = newSessions.Dequeue();
-                    if (!newAccount.IsConnected)
-                    {
-                        continue;
-                    }
-                    SessionAccount account = sessionAccounts.Find(k => k.License == newAccount.License && k.Steam == newAccount.Steam);
-                    if (account != null)
-                    {
-                        account.Deferrals = newAccount.Deferrals;
-                        account.Name = newAccount.Name;
-                        account.Handle = newAccount.Handle;
-                        account.HasPriority = newAccount.HasPriority;
-                        account.ReservedType = newAccount.ReservedType;
-                        if (account.State == SessionState.Grace)
-                        {
-                            account.State = SessionState.Loading;
-                            account.LoadStartTime = DateTime.UtcNow;
-                            account.Deferrals.done();
-                            continue;
-                        }
-                        if (account.State == SessionState.QueueGrace)
-                        {
-                            account.State = SessionState.Queue;
-                            account.Deferrals.update("Original queue position restored.");
-                            continue;
-                        }
-                        account.Deferrals.done("Connected too early. Try again."); continue;
-                    }
-                    account = newAccount;
-                    sessionAccounts.Add(account);
-                    newAccount.Deferrals.update("Added To Queue");
-                }
-            }
-            catch (Exception)
-            {
-                Debug.WriteLine($"[{resourceName} - ERROR] - SessionProcessing() - Handle New Sessions");
-            }
-            try
-            {
-                sessionAccounts.RemoveAll(k => ((k.State == SessionState.Grace || k.State == SessionState.QueueGrace) && k.DropStartTime.AddMinutes(graceTimeLimit) < DateTime.UtcNow) || k.State == SessionState.Banned || k.State == SessionState.Exiting);
-            }
-            catch (Exception)
-            {
-                Debug.WriteLine($"[{resourceName} - ERROR] - SessionProcessing() - Remove Expired Grace/Banned/Exited");
-            }
-            try
-            {
-                sessionAccounts = sessionAccounts.OrderBy(k => k.State).ThenBy(k => k.HasPriority == true).ThenBy(k => k.QueueStartTime).ToList();
-                sessionAccounts.ForEach(k =>
-                {
-                    ReservedAccount reserved = Server_Reserved.accounts.Find(j => j.License == k.License && j.Steam == k.Steam);
-                    if (reserved != null)
-                    {
-                        k.ReservedType = reserved.Reserve;
-                    }
-                    else
-                    {
-                        k.ReservedType = Reserved.Public;
-                    }
-                    ServerAccount priority = Server_Priority.accounts.Find(j => j.License == k.License && j.Steam == k.Steam);
-                    if (priority != null)
-                    {
-                        k.HasPriority = true;
-                    }
-                    else
-                    {
-                        k.HasPriority = false;
-                    }
-                });
-            }
-            catch (Exception)
-            {
-                Debug.WriteLine($"[{resourceName} - ERROR] - SessionProcessing() - Handle Priority and Reserve Changes");
-            }
-            try
-            {
-                int openReservedSessionTypeOne = reservedTypeOneSlots - sessionAccounts.Count(k => !k.IsQueued && k.ReservedTypeUsed == Reserved.Reserved1);
-                if (openReservedSessionTypeOne > 0)
-                {
-                    for (int i = 0; i < openReservedSessionTypeOne; i++)
-                    {
-                        SessionAccount account = sessionAccounts.FirstOrDefault(k => k.IsConnected && !k.IsQueued && k.ReservedType == Reserved.Reserved1 && k.ReservedTypeUsed != Reserved.Reserved1);
-                        if (account != null)
-                        {
-                            account.ReservedTypeUsed = Reserved.Reserved1;
-                            continue;
-                        }
-                        account = sessionAccounts.FirstOrDefault(k => k.IsConnected && k.State == SessionState.Queue && k.ReservedType == Reserved.Reserved1);
-                        if (account != null)
-                        {
-                            account.State = SessionState.Loading;
-                            account.ReservedTypeUsed = Reserved.Reserved1;
-                            account.LoadStartTime = DateTime.UtcNow;
-                            account.Deferrals.done();
-                            continue;
-                        }
-                        break;
-                    }
-                }
-            }
-            catch (Exception)
-            {
-                Debug.WriteLine($"[{resourceName} - ERROR] - SessionProcessing() - Handle Reserved Type 1 Allocation/Connection");
-            }
-            try
-            {
-                int openReservedSessionTypeTwo = reservedTypeTwoSlots - sessionAccounts.Count(k => !k.IsQueued && k.ReservedTypeUsed == Reserved.Reserved2);
-                if (openReservedSessionTypeTwo > 0)
-                {
-                    for (int i = 0; i < openReservedSessionTypeTwo; i++)
-                    {
-                        SessionAccount account = sessionAccounts.FirstOrDefault(k => k.IsConnected && !k.IsQueued && k.ReservedType == Reserved.Reserved2 && k.ReservedTypeUsed != Reserved.Reserved2);
-                        if (account != null)
-                        {
-                            account.ReservedTypeUsed = Reserved.Reserved2;
-                            continue;
-                        }
-                        account = sessionAccounts.FirstOrDefault(k => k.IsConnected && k.State == SessionState.Queue && (k.ReservedType == Reserved.Reserved2 || k.ReservedType == Reserved.Reserved1));
-                        if (account != null)
-                        {
-                            account.State = SessionState.Loading;
-                            account.ReservedTypeUsed = Reserved.Reserved2;
-                            account.LoadStartTime = DateTime.UtcNow;
-                            account.Deferrals.done();
-                            continue;
-                        }
-                        break;
-                    }
-                }
-            }
-            catch (Exception)
-            {
-                Debug.WriteLine($"[{resourceName} - ERROR] - SessionProcessing() - Handle Reserved Type 2 Allocation/Connection");
-            }
-            try
-            {
-                int openReservedSessionTypeThree = reservedTypeThreeSlots - sessionAccounts.Count(k => !k.IsQueued && k.ReservedTypeUsed == Reserved.Reserved3);
-                if (openReservedSessionTypeThree > 0)
-                {
-                    for (int i = 0; i < openReservedSessionTypeThree; i++)
-                    {
-                        SessionAccount account = sessionAccounts.FirstOrDefault(k => k.IsConnected && !k.IsQueued && k.ReservedType == Reserved.Reserved3 && k.ReservedTypeUsed != Reserved.Reserved3);
-                        if (account != null)
-                        {
-                            account.ReservedTypeUsed = Reserved.Reserved3;
-                            continue;
-                        }
-                        account = sessionAccounts.FirstOrDefault(k => k.IsConnected && k.State == SessionState.Queue && (k.ReservedType == Reserved.Reserved3 || k.ReservedType == Reserved.Reserved2 || k.ReservedType == Reserved.Reserved1));
-                        if (account != null)
-                        {
-                            account.State = SessionState.Loading;
-                            account.ReservedTypeUsed = Reserved.Reserved3;
-                            account.LoadStartTime = DateTime.UtcNow;
-                            account.Deferrals.done();
-                            continue;
-                        }
-                        break;
-                    }
-                }
-            }
-            catch (Exception)
-            {
-                Debug.WriteLine($"[{resourceName} - ERROR] - SessionProcessing() - Handle Reserved Type 3 Allocation/Connection");
-            }
-            try
-            {
-                int openSessionCount = maxSessions - reservedTypeOneSlots - reservedTypeTwoSlots - reservedTypeThreeSlots - sessionAccounts.Count(k => !k.IsQueued && k.ReservedTypeUsed == Reserved.Public);
-                if (openSessionCount > 0)
-                {
-                    for (int i = 0; i < openSessionCount; i++)
-                    {
-                        SessionAccount account = sessionAccounts.FirstOrDefault(k => k.IsConnected && !k.IsQueued && k.ReservedType == Reserved.Public && k.ReservedTypeUsed != Reserved.Public);
-                        if (account != null)
-                        {
-                            account.ReservedTypeUsed = Reserved.Public;
-                            continue;
-                        }
-                        account = sessionAccounts.FirstOrDefault(k => k.IsConnected && k.State == SessionState.Queue);
-                        if (account != null)
-                        {
-                            account.State = SessionState.Loading;
-                            account.ReservedTypeUsed = Reserved.Public;
-                            account.LoadStartTime = DateTime.UtcNow;
-                            account.Deferrals.done();
-                            continue;
-                        }
-                        break;
-                    }
-                }
-            }
-            catch (Exception)
-            {
-                Debug.WriteLine($"[{resourceName} - ERROR] - SessionProcessing() - Handle Pulic Slot Connection");
-            }
-            try
-            {
-                string json = JsonConvert.SerializeObject(sessionAccounts);
-                if (File.ReadAllText(fileSession) != json)
-                {
-                    File.WriteAllText(fileSession, json);
-                }
-            }
-            catch (Exception)
-            {
-                Debug.WriteLine($"[{resourceName} - ERROR] - SessionProcessing() - Handle Session File Update");
-            }
-            try
-            {
-                List<SessionAccount> queueAccounts = sessionAccounts.Where(k => (k.State == SessionState.Queue || k.State == SessionState.QueueGrace) && k.HasPriority == false).OrderBy(k => k.QueueStartTime).ToList();
-                int inQueue = queueAccounts.Count();
-                if (inQueue > 0)
-                {
-                    queueAccounts.ForEach(k =>
-                    {
-                        if (k.State == SessionState.Queue && k.IsConnected)
-                        {
-                            int index = queueAccounts.IndexOf(k) + 1;
-                            k.Deferrals.update($"You are currently {index} of {inQueue} in queue. Please wait{new string('.', dots)} ");
-                        }
-                    });
-                }
-            }
-            catch (Exception)
-            {
-                Debug.WriteLine($"[{resourceName} - ERROR] - SessionProcessing() - Handle Deferral Updates for Queued Players");
-            }
-            try
-            {
-                List<SessionAccount> queuePriorityAccounts = sessionAccounts.Where(k => (k.State == SessionState.Queue || k.State == SessionState.QueueGrace) && k.HasPriority == true).OrderBy(k => k.QueueStartTime).ToList();
-                int inQueuePriority = queuePriorityAccounts.Count();
-                if (inQueuePriority > 0)
-                {
-                    queuePriorityAccounts.ForEach(k =>
-                    {
-                        if (k.State == SessionState.Queue && k.IsConnected)
-                        {
-                            int index = queuePriorityAccounts.IndexOf(k) + 1;
-                            k.Deferrals.update($"You are currently {index} of {inQueuePriority} in priority queue. Please wait{new string('.', dots)} ");
-                        }
-                    });
-                }
-            }
-            catch (Exception)
-            {
-                Debug.WriteLine($"[{resourceName} - ERROR] - SessionProcessing() - Handle Deferral Updates for Queued Priority Players");
-            }
-            try
-            {
-                if (dots >= 3) { dots = 1; } else { dots++; }
-            }
-            catch (Exception)
-            {
-                Debug.WriteLine($"[{resourceName} - ERROR] - SessionProcessing() - Handle Dots Update");
-            }
-            await Delay(3000);
-        }
-
-        private async void PlayerConnecting([FromSource] Player source, string playerName, CallbackDelegate denyWithReason, dynamic deferrals)
-        {
-            try
-            {
-                var Defer = (CallbackDelegate)deferrals.defer;
-                var Update = (CallbackDelegate)deferrals.update;
-                var Done = (CallbackDelegate)deferrals.done;
-                if (!ready)
-                {
-                    Done("Session is not fully loaded. Try again.");
-                    return;
-                }
-                Defer();
-                await Delay(1000);
-
-                Update("Connecting...");
                 string license = source.Identifiers["license"];
-                string steam = source.Identifiers["steam"];
                 if (license == null)
                 {
-                    Done("License is required.");
                     return;
                 }
-                if (steam == null)
+                if (!session.ContainsKey(license) || message == "Exited")
                 {
-                    Done("Steam is required.");
                     return;
                 }
-                ServerAccount bannedAccount = Server_Banned.accounts.Find(k => k.Steam == steam && k.License == license);
-                if (bannedAccount != null)
-                {
-                    Done("This account is banned.");
-                    return;
-                }
-                else if (bannedAccount == null && (Server_Banned.accounts.Exists(k => k.Steam == steam) || Server_Banned.accounts.Exists(k => k.License == license)))
-                {
-                    bannedAccount = new ServerAccount(license, steam);
-                    Server_Banned.AutoBan(bannedAccount);
-                    Done("Changing accounts to avoid a ban is not allowed.");
-                    return;
-                }
-                SessionAccount account = sessionAccounts.Find(k => k.License == license && k.Steam == steam);
-                if (account != null)
-                {
-                    account.Source = source;
-                    account.Name = source.Name;
-                    account.Handle = source.Handle;
-                    account.Deferrals = deferrals;
-                }
-                else
-                {
-                    account = new SessionAccount(source, license, steam, source.Name, source.Handle, deferrals, DateTime.UtcNow);
-                }
-                if (Server_Priority.accounts.Exists(k => k.License == account.License && k.Steam == account.Steam))
-                {
-                    account.HasPriority = true;
-                }
-                else
-                {
-                    account.HasPriority = false;
-                }
-                ReservedAccount reservedAccount = Server_Reserved.accounts.Find(k => k.Steam == steam && k.License == license);
-                if (reservedAccount != null)
-                {
-                    account.ReservedType = reservedAccount.Reserve;
-                }
-                else
-                {
-                    ReservedAccount tempReserved = Server_Reserved.newwhitelist.Find(k => k.Steam == steam || k.License == license);
-                    if (tempReserved == null)
-                    {
-                        account.ReservedType = Reserved.Public;
-                    }
-                    else
-                    {
-                        account.ReservedType = tempReserved.Reserve;
-                        Server_Reserved.AutoWhitelist(new ReservedAccount(account.License, account.Steam, account.ReservedType));
-                        Server_Reserved.newwhitelist.RemoveAll(k => k.Steam == account.Steam || k.License == account.License);
-                    }
-                }
-                if (!account.IsConnected)
-                {
-                    Done("Dropped");
-                    return;
-                }
-                if (whitelistonly && account.ReservedType == Reserved.Public)
-                {
-                    Done("You are not whitelisted.");
-                    return;
-                }
-                newSessions.Enqueue(account);
-            }
-            catch (Exception)
-            {
-                Debug.WriteLine($"[{resourceName} - ERROR] - PlayerConnecting()");
-            }
-        }
-
-        private async void PlayerDropped([FromSource] Player source, string message)
-        {
-            try
-            {
-                SessionAccount account = sessionAccounts.Find(k => k.Steam == source.Identifiers["steam"] && k.License == source.Identifiers["license"]);
-                if (account != null)
-                {
-                    account.DropStartTime = DateTime.UtcNow;
-                    if (message.Contains("Banned"))
-                    {
-                        Debug.WriteLine($"Banned player was dropped. ({source.Name}) ({source.Handle})"); account.State = SessionState.Banned;
-                        return;
-                    }
-                    if (message.Contains("Exited"))
-                    {
-                        Debug.WriteLine($"Player exited was dropped. ({source.Name}) ({source.Handle})"); account.State = SessionState.Exiting;
-                        return;
-                    }
-                    if (message.Contains("Kicked"))
-                    {
-                        Debug.WriteLine($"Player kicked kicked was dropped. ({source.Name}) ({source.Handle})"); account.State = SessionState.Exiting;
-                        return;
-                    }
-                    droppedSessions.Enqueue(account);
-                }
-                else
-                {
-                    Debug.WriteLine($"[{resourceName} DROPPED : WARNING] - Unknown Player Dropped : {source.Identifiers["steam"]} : {source.Identifiers["license"]} : {source.Name}");
-                }
+                session.TryGetValue(license, out SessionState oldState);
+                session.TryUpdate(license, SessionState.Grace, oldState);
+                Debug.WriteLine($"[{resourceName}]: {Enum.GetName(typeof(SessionState), oldState).ToUpper()} -> GRACE -> {license}");
+                UpdateTimer(license);
             }
             catch (Exception)
             {
                 Debug.WriteLine($"[{resourceName} - ERROR] - PlayerDropped()");
             }
-            await Delay(0);
         }
 
-        private async void PlayerActivated([FromSource] Player source)
+        private void PlayerActivated([FromSource] Player source)
         {
             try
             {
-                SessionAccount account = sessionAccounts.Find(k => k.License == source.Identifiers["license"] && k.Steam == source.Identifiers["steam"]);
-                if (account != null)
+                string license = source.Identifiers["license"];
+                if (!session.ContainsKey(license))
                 {
-                    account.Handle = source.Handle;
-                    activeSessions.Enqueue(account);
+                    session.TryAdd(license, SessionState.Active);
+                    return;
                 }
-                else
-                {
-                    Debug.WriteLine($"[{resourceName} ACTIVATED : WARNING] - Unknown Player Activated : {source.Identifiers["steam"]} : {source.Identifiers["license"]} : {source.Name}");
-                    source.Drop("No Session Account Exists");
-                }
+                session.TryGetValue(license, out SessionState oldState);
+                session.TryUpdate(license, SessionState.Active, oldState);
+                Debug.WriteLine($"[{resourceName}]: {Enum.GetName(typeof(SessionState), oldState).ToUpper()} -> ACTIVE -> {license}");
             }
             catch (Exception)
             {
                 Debug.WriteLine($"[{resourceName} - ERROR] - PlayerActivated()");
             }
-            await Delay(0);
+        }
+
+        private async void PlayerConnecting([FromSource] Player source, string playerName, dynamic denyWithReason, dynamic deferrals)
+        {
+            try
+            {
+                deferrals.defer();
+                await Delay(500);
+                while (!IsEverythingReady()) { await Delay(0); }
+                deferrals.update($"{messages["Gathering"]}");
+                string license = source.Identifiers["license"];
+                string steam = source.Identifiers["steam"];
+                if (license == null) { deferrals.done($"{messages["License"]}"); return; }
+                if (steam == null) { deferrals.done($"{messages["Steam"]}"); return; }
+
+                bool banned = false;
+                if (Server_Banned.accounts.Exists(k => k.License == license && k.Steam == steam))
+                {
+                    banned = true;
+                }
+                else if (Server_Banned.accounts.Exists(k => k.License == license || k.Steam == steam) || Server_Banned.newblacklist.Exists(k => k.License == license || k.Steam == steam))
+                {
+                    banned = true;
+                    Server_Banned.AutoBlacklist(new BannedAccount(license, steam));
+                }
+
+                if (banned)
+                {
+                    deferrals.done($"{messages["Banned"]}");
+                    RemoveFrom(license, true, true, true, true, true, true);
+                    return;
+                }
+
+                if (sentLoading.ContainsKey(license))
+                {
+                    sentLoading.TryRemove(license, out Player oldPlayer);
+                }
+                sentLoading.TryAdd(license, source);
+
+                if (session.TryAdd(license, SessionState.Queue))
+                {
+                    if (Server_Reserved.newwhitelist.Exists(k => k.License == license || k.Steam == steam))
+                    {
+                        Server_Reserved.AutoWhitelist(new ReservedAccount(license, steam, Server_Reserved.newwhitelist.FirstOrDefault(k => k.License == license || k.Steam == steam).Reserve));
+                    }
+                    if (Server_Reserved.accounts.Exists(k => k.License == license || k.Steam == steam))
+                    {
+                        if (!reserved.TryAdd(license, Server_Reserved.accounts.FirstOrDefault(k => k.License == license).Reserve))
+                        {
+                            reserved.TryGetValue(license, out Reserved oldReserved);
+                            reserved.TryUpdate(license, Server_Reserved.accounts.FirstOrDefault(k => k.License == license).Reserve, oldReserved);
+                        }
+                    }
+                    else
+                    {
+                        RemoveFrom(license, false, false, false, false, true, true);
+                        if (whitelistonly)
+                        {
+                            deferrals.done($"{messages["Whitelist"]}");
+                            return;
+                        }
+                    }
+
+                    if (Server_Priority.newwhitelist.Exists(k => k.License == license || k.Steam == steam))
+                    {
+                        Server_Priority.AutoWhitelist(new PriorityAccount(license, steam, Server_Priority.newwhitelist.FirstOrDefault(k => k.License == license || k.Steam == steam).Priority));
+                    }
+                    if (Server_Priority.accounts.Exists(k => k.License == license))
+                    {
+                        if (!priority.TryAdd(license, Server_Priority.accounts.FirstOrDefault(k => k.License == license).Priority))
+                        {
+                            priority.TryGetValue(license, out int oldPriority);
+                            priority.TryUpdate(license, Server_Priority.accounts.FirstOrDefault(k => k.License == license).Priority, oldPriority);
+                        }
+                    }
+                    else
+                    {
+                        RemoveFrom(license, false, false, false, true, false, false);
+                    }
+
+                    if (!priority.ContainsKey(license))
+                    {
+                        newQueue.Enqueue(license);
+                        Debug.WriteLine($"[{resourceName}]: NEW -> QUEUE -> (Public) {license}");
+                    }
+                    else
+                    {
+                        newPQueue.Enqueue(license);
+                        Debug.WriteLine($"[{resourceName}]: NEW -> QUEUE -> (Priority) {license}");
+                    }
+                }
+
+                if (!session[license].Equals(SessionState.Queue))
+                {
+                    UpdateTimer(license);
+                    session.TryGetValue(license, out SessionState oldState);
+                    session.TryUpdate(license, SessionState.Loading, oldState);
+                    deferrals.done();
+                    Debug.WriteLine($"[{resourceName}]: {Enum.GetName(typeof(SessionState), oldState).ToUpper()} -> LOADING -> (Grace) {license}");
+                    return;
+                }
+
+                bool inPriority = priority.ContainsKey(license);
+                int dots = 0;
+
+                while (session[license].Equals(SessionState.Queue))
+                {
+                    if (index.ContainsKey(license) && index.TryGetValue(license, out int position))
+                    {
+                        int count = inPriority ? inPriorityQueue : inQueue;
+                        string message = inPriority ? $"{messages["PriorityQueue"]}" : $"{messages["Queue"]}";
+                        deferrals.update($"{message} {position} / {count}{new string('.', dots)}");
+                    }
+                    dots = dots > 2 ? 0 : dots + 1;
+                    if (source?.EndPoint == null)
+                    {
+                        UpdateTimer(license);
+                        deferrals.done($"{messages["Canceled"]}");
+                        Debug.WriteLine($"[{resourceName}]: QUEUE -> CANCELED -> {license}");
+                        return;
+                    }
+                    RemoveFrom(license, false, false, true, false, false, false);
+                    await Delay(5000);
+                }
+                await Delay(500);
+                deferrals.done();
+            }
+            catch (Exception)
+            {
+                deferrals.done($"{messages["Error"]}"); return;
+            }
+        }
+
+        private async Task QueueCycle()
+        {
+            if (testsubjects != 0)
+            {
+                AddTesters();
+            }
+            while (true)
+            {
+                try
+                {
+                    inPriorityQueue = PriorityQueueCount();
+                    await Delay(100);
+                    inQueue = QueueCount();
+                    await Delay(100);
+                    UpdateHostName();
+                    UpdateStates();
+                    await Delay(100);
+                    BalanceReserved();
+                    await Delay(1000);
+                }
+                catch (Exception)
+                {
+                    Debug.WriteLine($"[{resourceName} - ERROR] - QueueCycle()");
+                }
+            }
+        }
+
+        private void AddTesters()
+        {
+            for (int i = 1; i < testsubjects; i++)
+            {
+                string tester = $"{i}-Tester";
+                session.TryAdd(tester, SessionState.Queue);
+                queue.Enqueue(tester);
+            }
+        }
+
+        private void SteamProfileToHex(int source, List<object> args, string raw)
+        {
+            try
+            {
+                if (args.Count != 1) { Debug.WriteLine($"Command requires 1 argument. <Steam Community Profile Number>"); }
+                long SteamCommunityId = long.Parse(args[0].ToString());
+                long quotient = Math.DivRem(SteamCommunityId, 16, out long remainder);
+                Stack<long> hex = new Stack<long>();
+                hex.Push(remainder);
+                while (quotient != 0)
+                {
+                    quotient = Math.DivRem(quotient, 16, out remainder);
+                    hex.Push(remainder);
+                }
+                string steamHex = string.Empty;
+                while (hex.Count != 0)
+                {
+                    steamHex = string.Concat(steamHex, hex.Pop().ToString("x"));
+                }
+                Debug.WriteLine($"{steamHex}");
+            }
+            catch(Exception)
+            {
+                Debug.WriteLine($"[{resourceName} - ERROR] - SteamProfileToHex()");
+            }
         }
     }
 
-    static class Server_Banned
+    class PriorityAccount
     {
-        static readonly string directory = $"resources/{Server_Queue.resourceName}/JSON/Banned";
-        static List<FileInfo> files = new List<FileInfo>();
-        internal static List<ServerAccount> accounts = new List<ServerAccount>();
+        public string License { get; set; }
+        public string Steam { get; set; }
+        public int Priority { get; set; }
 
-        internal static void Start()
+        public PriorityAccount(string license, string steam, int priority)
         {
-            try
-            {
-                if (!Directory.Exists(directory))
-                {
-                    Directory.CreateDirectory(directory);
-                }
-                DirectoryInfo di = new DirectoryInfo(directory);
-                files = di.GetFiles("*.json").ToList();
-                files.ForEach(k =>
-                {
-                    accounts.Add(JsonConvert.DeserializeObject<ServerAccount>(File.ReadAllText(k.FullName).ToString()));
-                });
-                API.RegisterCommand("q_addban", new Action<int, List<object>, string>(Add), true);
-                API.RegisterCommand("q_removeban", new Action<int, List<object>, string>(Remove), true);
-                API.RegisterCommand("q_kick", new Action<int, List<object>, string>(Kick), true);
-            }
-            catch (Exception)
-            {
-                Debug.WriteLine($"[{Server_Queue.resourceName} - ERROR] - Server_Banned.Start()");
-            }
-        }
-
-        internal static async void Add(int source, List<object> args, string raw)
-        {
-            try
-            {
-                if (args.Count() != 1)
-                {
-                    Debug.WriteLine($"This command requires one arguement. <Handle> OR <Steam> OR <License>");
-                    return;
-                }
-                string identifier = args[0].ToString();
-                SessionAccount account = Server_Queue.sessionAccounts.Find(k => k.Handle == identifier || k.License == identifier || k.Steam == identifier);
-                if (account == null)
-                {
-                    Debug.WriteLine($"No matching account in session for {identifier}, use session command to get an identifier.");
-                    return;
-                }
-                if (accounts.Exists(k => k.License == account.License))
-                {
-                    Debug.WriteLine($"{identifier} is already banned.");
-                    return;
-                }
-                ServerAccount banned = new ServerAccount(account.License, account.Steam);
-                accounts.Add(banned);
-                Function.Call(Hash.DROP_PLAYER, account.Handle, "Banned");
-                string path = $"{directory}/{banned.License}-{banned.Steam}.json";
-                File.WriteAllText(path, JsonConvert.SerializeObject(banned));
-                Debug.WriteLine($"{identifier} was banned.");
-            }
-            catch (Exception)
-            {
-                Debug.WriteLine($"[{Server_Queue.resourceName} - ERROR] - Server_Banned.Add()");
-            }
-            await BaseScript.Delay(1000);
-            return;
-        }
-
-        internal static async void Remove(int source, List<object> args, string raw)
-        {
-            try
-            {
-                if (args.Count() != 1)
-                {
-                    Debug.WriteLine($"This command requires one arguement. <Steam> OR <License>");
-                    return;
-                }
-                string identifier = args[0].ToString();
-                ServerAccount account = accounts.Find(k => k.License == identifier || k.Steam == identifier);
-                if (account == null)
-                {
-                    Debug.WriteLine($"No matching account in bans for {identifier}");
-                    return;
-                }
-                accounts.RemoveAll(k => k.License == account.License && k.Steam == account.Steam);
-                string path = $"{directory}/{account.License}-{account.Steam}.json";
-                File.Delete(path);
-                Debug.WriteLine($"{identifier} was removed from banned list.");
-            }
-            catch (Exception)
-            {
-                Debug.WriteLine($"[{Server_Queue.resourceName} - ERROR] - Server_Banned.Remove()");
-            }
-            await BaseScript.Delay(1000);
-            return;
-        }
-
-        internal static async void AutoBan(ServerAccount account)
-        {
-            try
-            {
-                accounts.Add(account);
-                string path = $"{directory}/{account.License}-{account.Steam}.json";
-                File.WriteAllText(path, JsonConvert.SerializeObject(account));
-                Debug.WriteLine($"{account.License}-{account.Steam} was auto banned.");
-            }
-            catch (Exception)
-            {
-                Debug.WriteLine($"[{Server_Queue.resourceName} - ERROR] - Server_Banned.AutoBan()");
-            }
-            await BaseScript.Delay(1000);
-        }
-
-        internal static async void Kick(int source, List<object> args, string raw)
-        {
-            try
-            {
-                if (args.Count() != 1)
-                {
-                    Debug.WriteLine($"This command requires one arguement. <Handle> OR <Steam> OR <License>");
-                    return;
-                }
-                string identifier = args[0].ToString();
-                SessionAccount account = Server_Queue.sessionAccounts.Find(k => k.Handle == identifier || k.License == identifier || k.Steam == identifier);
-                if (account == null)
-                {
-                    Debug.WriteLine($"No matching account in session for {identifier}, use session command to get an identifier.");
-                    return;
-                }
-                Function.Call(Hash.DROP_PLAYER, account.Handle, "Kicked");
-                Debug.WriteLine($"{identifier} was kicked.");
-            }
-            catch (Exception)
-            {
-                Debug.WriteLine($"[{Server_Queue.resourceName} - ERROR] - Server_Banned.Kick()");
-            }
-            await BaseScript.Delay(1000);
-            return;
+            License = license;
+            Steam = steam;
+            Priority = priority;
         }
     }
 
-    static class Server_Priority
+    class Server_Priority : BaseScript
     {
         static readonly string directory = $"resources/{Server_Queue.resourceName}/JSON/Priority";
         static List<FileInfo> files = new List<FileInfo>();
-        internal static List<ServerAccount> accounts = new List<ServerAccount>();
+        internal static List<PriorityAccount> accounts = new List<PriorityAccount>();
+        internal static List<PriorityAccount> newwhitelist = new List<PriorityAccount>();
 
-        internal static void Start()
+        public Server_Priority()
         {
             try
             {
@@ -881,10 +946,25 @@ namespace Server_Queue
                 files = di.GetFiles("*.json").ToList();
                 files.ForEach(k =>
                 {
-                    accounts.Add(JsonConvert.DeserializeObject<ServerAccount>(File.ReadAllText(k.FullName).ToString()));
+                    accounts.Add(JsonConvert.DeserializeObject<PriorityAccount>(File.ReadAllText(k.FullName).ToString()));
                 });
+                accounts.ForEach(k =>
+                {
+                    if (k.Priority <= 0 || k.Priority > 100)
+                    {
+                        k.Priority = 100;
+                        string path = $"{directory}/{k.License}-{k.Steam}.json";
+                        File.WriteAllText(path, JsonConvert.SerializeObject(k));
+                    }
+                    Server_Queue.priority.TryAdd(k.License, k.Priority);
+                });
+                if (File.Exists($"resources/{Server_Queue.resourceName}/JSON/offlinepriority.json"))
+                {
+                    newwhitelist = JsonConvert.DeserializeObject<List<PriorityAccount>>(File.ReadAllText($"resources/{Server_Queue.resourceName}/JSON/offlinepriority.json").ToString());
+                }
                 API.RegisterCommand("q_addpriority", new Action<int, List<object>, string>(Add), true);
                 API.RegisterCommand("q_removepriority", new Action<int, List<object>, string>(Remove), true);
+                Server_Queue.priorityReady = true;
             }
             catch (Exception)
             {
@@ -892,249 +972,95 @@ namespace Server_Queue
             }
         }
 
-        internal static async void Add(int source, List<object> args, string raw)
+        internal void Add(int source, List<object> args, string raw)
         {
             try
             {
-                if (args.Count() != 1)
+                if (args.Count != 2)
                 {
-                    Debug.WriteLine($"This command requires one arguement. <Handle> OR <Steam> OR <License>");
+                    Debug.WriteLine($"This command requires two arguments. <Steam> OR <License> AND <Priority> (1 - 100)");
                     return;
                 }
                 string identifier = args[0].ToString();
-                SessionAccount account = Server_Queue.sessionAccounts.Find(k => k.Handle == identifier || k.License == identifier || k.Steam == identifier);
-                if (account == null)
+                int priority = int.Parse(args[1].ToString());
+                if (priority <= 0 || priority > 100) { priority = 100; }
+                Player player = Players.FirstOrDefault(k => k.Identifiers["license"] == identifier || k.Identifiers["steam"] == identifier);
+                if (player != null)
                 {
-                    Debug.WriteLine($"No matching account in session for {identifier}, use session command to get an identifier.");
-                    return;
+                    PriorityAccount account = new PriorityAccount(player.Identifiers["license"], player.Identifiers["steam"], priority);
+                    accounts.Add(account);
+                    if (!Server_Queue.priority.TryAdd(account.License, priority))
+                    {
+                        Server_Queue.priority.TryGetValue(account.License, out int oldPriority);
+                        Server_Queue.priority.TryUpdate(account.License, priority, oldPriority);
+                    }
+                    string path = $"{directory}/{account.License}-{account.Steam}.json";
+                    File.WriteAllText(path, JsonConvert.SerializeObject(account));
+                    Debug.WriteLine($"{identifier} was granted priority.");
                 }
-                if (accounts.Exists(k => k.License == account.License))
+                else
                 {
-                    Debug.WriteLine($"{identifier} already has priority.");
-                    return;
+                    Debug.WriteLine($"No account found in session for {identifier}, adding to offline priority list");
+                    newwhitelist.Add(new PriorityAccount(identifier, identifier, priority));
+                    string path = $"resources/{Server_Queue.resourceName}/JSON/offlinepriority.json";
+                    File.WriteAllText(path, JsonConvert.SerializeObject(newwhitelist));
                 }
-                ServerAccount priority = new ServerAccount(account.License, account.Steam);
-                accounts.Add(priority);
-                string path = $"{directory}/{priority.License}-{priority.Steam}.json";
-                File.WriteAllText(path, JsonConvert.SerializeObject(priority));
-                Debug.WriteLine($"{identifier} was granted priority.");
             }
             catch (Exception)
             {
                 Debug.WriteLine($"[{Server_Queue.resourceName} - ERROR] - Server_Priority.Add()");
             }
-            await BaseScript.Delay(1000);
             return;
         }
 
-        internal static async void Remove(int source, List<object> args, string raw)
+        internal static void Remove(int source, List<object> args, string raw)
         {
             try
             {
-                if (args.Count() != 1)
+                if (args.Count != 1)
                 {
-                    Debug.WriteLine($"This command requires one arguement. <Handle> OR <Steam> OR <License>");
+                    Debug.WriteLine($"This command requires one argument. <Steam> OR <License>");
                     return;
                 }
                 string identifier = args[0].ToString();
-                SessionAccount account = Server_Queue.sessionAccounts.Find(k => k.Handle == identifier || k.License == identifier || k.Steam == identifier);
-                if (account == null)
+                newwhitelist.Where(k => k.License == identifier || k.Steam == identifier).ToList().ForEach(j =>
                 {
-                    Debug.WriteLine($"No matching account in session for {identifier}, use session command to get an identifier.");
-                    return;
-                }
-                if (!accounts.Exists(k => k.License == account.License))
+                    newwhitelist.Remove(j);
+                });
+                string path = $"resources/{Server_Queue.resourceName}/JSON/offlinepriority.json";
+                File.WriteAllText(path, JsonConvert.SerializeObject(newwhitelist));
+                accounts.Where(k => k.License == identifier || k.Steam == identifier).ToList().ForEach(j =>
                 {
-                    Debug.WriteLine($"{identifier} does not have priority.");
-                    return;
-                }
-                accounts.RemoveAll(k => k.License == account.License && k.Steam == account.Steam);
-                string path = $"{directory}/{account.License}-{account.Steam}.json";
-                File.Delete(path);
+                    path = $"{directory}/{j.License}-{j.Steam}.json";
+                    File.Delete(path);
+                    accounts.Remove(j);
+                });
+                Server_Queue.priority.TryRemove(identifier, out int oldPriority);
                 Debug.WriteLine($"{identifier} was removed from priority list.");
             }
             catch (Exception)
             {
                 Debug.WriteLine($"[{Server_Queue.resourceName} - ERROR] - Server_Priority.Remove()");
             }
-            await BaseScript.Delay(1000);
-            return;
-        }
-    }
-
-    static class Server_Reserved
-    {
-        static readonly string directory = $"resources/{Server_Queue.resourceName}/JSON/Reserved";
-        static List<FileInfo> files = new List<FileInfo>();
-        internal static List<ReservedAccount> accounts = new List<ReservedAccount>();
-        internal static List<ReservedAccount> newwhitelist = new List<ReservedAccount>();
-
-        internal static void Start()
-        {
-            try
-            {
-                if (!Directory.Exists(directory))
-                {
-                    Directory.CreateDirectory(directory);
-                }
-                DirectoryInfo di = new DirectoryInfo(directory);
-                files = di.GetFiles("*.json").ToList();
-                files.ForEach(k =>
-                {
-                    accounts.Add(JsonConvert.DeserializeObject<ReservedAccount>(File.ReadAllText(k.FullName).ToString()));
-                });
-                API.RegisterCommand("q_addreserve", new Action<int, List<object>, string>(Add), true);
-                API.RegisterCommand("q_removereserve", new Action<int, List<object>, string>(Remove), true);
-                API.RegisterCommand("q_offlinereserve", new Action<int, List<object>, string>(OfflineReserve), true);
-            }
-            catch (Exception)
-            {
-                Debug.WriteLine($"[{Server_Queue.resourceName} - ERROR] - Server_Reserved.Start()");
-            }
-        }
-
-        internal static async void Add(int source, List<object> args, string raw)
-        {
-            try
-            {
-                if (args.Count() != 2)
-                {
-                    Debug.WriteLine($"This command requires two arguements. <Handle> OR <Steam> OR <License> AND <Slot Type> (1, 2, or 3)");
-                    return;
-                }
-                string identifier = args[0].ToString();
-                string type = args[1].ToString();
-                bool valid = type == "1" || type == "2" || type == "3";
-                if (!valid)
-                {
-                    Debug.WriteLine($"Reserved type must be between 1, 2, or 3");
-                    return;
-                }
-                SessionAccount account = Server_Queue.sessionAccounts.Find(k => k.Handle == identifier || k.License == identifier || k.Steam == identifier);
-                if (account == null)
-                {
-                    Debug.WriteLine($"No matching account in session for {identifier}, use session command to get an identifier.");
-                    return;
-                }
-                ReservedAccount reserved = new ReservedAccount(account.License, account.Steam, (Reserved)int.Parse(type));
-                if (!accounts.Exists(k => k.License == account.License && k.Steam == account.Steam))
-                {
-                    accounts.Add(reserved);
-                }
-                else
-                {
-                    accounts.Find(k => k.License == account.License && k.Steam == account.Steam).Reserve = (Reserved)int.Parse(type);
-                }
-                string path = $"{directory}/{reserved.License}-{reserved.Steam}.json";
-                File.WriteAllText(path, JsonConvert.SerializeObject(reserved));
-                Debug.WriteLine($"{identifier} was granted {Enum.GetName(typeof(Reserved), reserved.Reserve)} slot.");
-            }
-            catch (Exception)
-            {
-                Debug.WriteLine($"[{Server_Queue.resourceName} - ERROR] - Server_Reserved.Add()");
-            }
-            await BaseScript.Delay(1000);
             return;
         }
 
-        internal static async void Remove(int source, List<object> args, string raw)
-        {
-            try
-            {
-                if (args.Count() != 1)
-                {
-                    Debug.WriteLine($"This command requires one arguement. <Handle> OR <Steam> OR <License>");
-                    return;
-                }
-                string identifier = args[0].ToString();
-                SessionAccount account = Server_Queue.sessionAccounts.Find(k => k.Handle == identifier || k.License == identifier || k.Steam == identifier);
-                if (account == null)
-                {
-                    Debug.WriteLine($"No matching account in session for {identifier}, use session command to get an identifier.");
-                    return;
-                }
-                if (!accounts.Exists(k => k.License == account.License))
-                {
-                    Debug.WriteLine($"{identifier} does not have a reserved slot.");
-                    return;
-                }
-                accounts.RemoveAll(k => k.License == account.License && k.Steam == account.Steam);
-                string path = $"{directory}/{account.License}-{account.Steam}.json";
-                File.Delete(path);
-                Debug.WriteLine($"{identifier} was removed from reserved slot list.");
-            }
-            catch (Exception)
-            {
-                Debug.WriteLine($"[{Server_Queue.resourceName} - ERROR] - Server_Reserved.Remove()");
-            }
-            await BaseScript.Delay(1000);
-            return;
-        }
-
-        internal static async void OfflineReserve(int source, List<object> args, string raw)
-        {
-            try
-            {
-                if (args.Count() != 2)
-                {
-                    Debug.WriteLine($"This command requires two arguements. <Steam> or <License> and 0 or 1 or 2 or 3.");
-                    return;
-                }
-                string identifier = args[0].ToString();
-                string type = args[1].ToString();
-                bool valid = type == "0" || type == "1" || type == "2" || type == "3";
-                if (!valid)
-                {
-                    if (!valid)
-                    {
-                        Debug.WriteLine($"Reserved type must be 0 or 1 or 2 or 3.");
-                        return;
-                    }
-                }
-                ReservedAccount account = newwhitelist.Find(k => k.License == identifier || k.Steam == identifier);
-                if (account != null)
-                {
-                    account.Steam = identifier;
-                    account.License = identifier;
-                    Debug.WriteLine($"Successfully change {identifier} in the temporary reserved list. They need to join the queue before server restart.");
-                    return;
-                }
-                newwhitelist.Add(new ReservedAccount(identifier, identifier, (Reserved)int.Parse(type)));
-                Debug.WriteLine($"Successfully added {identifier} to the temporary reserved list. They need to join the queue before server restart.");
-            }
-            catch (Exception)
-            {
-                Debug.WriteLine($"[{Server_Queue.resourceName} - ERROR] - Server_Reserved.NewWhitelist()");
-            }
-            await BaseScript.Delay(1000);
-        }
-
-        internal static async void AutoWhitelist(ReservedAccount account)
+        internal static void AutoWhitelist(PriorityAccount account)
         {
             try
             {
                 accounts.Add(account);
                 string path = $"{directory}/{account.License}-{account.Steam}.json";
                 File.WriteAllText(path, JsonConvert.SerializeObject(account));
-                Debug.WriteLine($"{account.License}-{account.Steam} was auto reserved.");
+                newwhitelist.RemoveAll(k => k.License == account.License || k.Steam == account.Steam);
+                path = $"resources/{Server_Queue.resourceName}/JSON/offlinepriority.json";
+                File.WriteAllText(path, JsonConvert.SerializeObject(newwhitelist));
+                Debug.WriteLine($"{account.License}-{account.Steam} was auto prioritized.");
             }
             catch (Exception)
             {
-                Debug.WriteLine($"[{Server_Queue.resourceName} - ERROR] - Server_Reserved.AutoWhitelist()");
+                Debug.WriteLine($"[{Server_Queue.resourceName} - ERROR] - Server_Priority.AutoWhitelist()");
             }
-            await BaseScript.Delay(1000);
-        }
-    }
-
-    class ServerAccount
-    {
-        public string License { get; set; }
-        public string Steam { get; set; }
-
-        public ServerAccount(string license, string steam)
-        {
-            License = license;
-            Steam = steam;
         }
     }
 
@@ -1152,71 +1078,282 @@ namespace Server_Queue
         }
     }
 
-    class SessionAccount
+    class Server_Reserved : BaseScript
     {
-        [JsonIgnore] public Player Source { get; set; }
-        public string License { get; set; }
-        public string Steam { get; set; }
-        public string Name { get; set; }
-        public string Handle { get; set; }
-        [JsonIgnore] public dynamic Deferrals { get; set; }
-        public SessionState State { get; set; } = SessionState.Queue;
-        public DateTime QueueStartTime { get; set; }
-        [JsonIgnore] public DateTime LoadStartTime { get; set; }
-        [JsonIgnore] public DateTime DropStartTime { get; set; }
-        public bool HasPriority { get; set; } = false;
-        public Reserved ReservedType { get; set; } = Reserved.Public;
-        public Reserved ReservedTypeUsed { get; set; } = Reserved.Public;
-        [JsonIgnore] public bool IsConnected { get { return Source?.EndPoint != null; } }
-        [JsonIgnore] public bool IsQueued { get { return State != SessionState.Grace && State != SessionState.Loading && State != SessionState.Active; } }
+        static readonly string directory = $"resources/{Server_Queue.resourceName}/JSON/Reserved";
+        static List<FileInfo> files = new List<FileInfo>();
+        internal static List<ReservedAccount> accounts = new List<ReservedAccount>();
+        internal static List<ReservedAccount> newwhitelist = new List<ReservedAccount>();
 
-        public SessionAccount(Player source, string license, string steam, string name, string handle, dynamic deferrals, DateTime queuestarttime)
+        public Server_Reserved()
         {
-            Source = source;
-            License = license;
-            Steam = steam;
-            Name = name;
-            Handle = handle;
-            Deferrals = deferrals;
-            QueueStartTime = queuestarttime;
+            try
+            {
+                if (!Directory.Exists(directory))
+                {
+                    Directory.CreateDirectory(directory);
+                }
+                DirectoryInfo di = new DirectoryInfo(directory);
+                files = di.GetFiles("*.json").ToList();
+                files.ForEach(k =>
+                {
+                    accounts.Add(JsonConvert.DeserializeObject<ReservedAccount>(File.ReadAllText(k.FullName).ToString()));
+                });
+                accounts.ForEach(k =>
+                {
+                    Server_Queue.reserved.TryAdd(k.License, k.Reserve);
+                });
+                if (File.Exists($"resources/{Server_Queue.resourceName}/JSON/offlinereserve.json"))
+                {
+                    newwhitelist = JsonConvert.DeserializeObject<List<ReservedAccount>>(File.ReadAllText($"resources/{Server_Queue.resourceName}/JSON/offlinereserve.json").ToString());
+                }
+                API.RegisterCommand("q_addreserve", new Action<int, List<object>, string>(Add), true);
+                API.RegisterCommand("q_removereserve", new Action<int, List<object>, string>(Remove), true);
+                Server_Queue.reservedReady = true;
+            }
+            catch (Exception)
+            {
+                Debug.WriteLine($"[{Server_Queue.resourceName} - ERROR] - Server_Reserved.Start()");
+            }
+        }
+
+        internal void Add(int source, List<object> args, string raw)
+        {
+            try
+            {
+                if (args.Count != 2)
+                {
+                    Debug.WriteLine($"This command requires two arguments. <Steam> OR <License> AND <Reserved> (1, 2, or 3)");
+                    return;
+                }
+                string identifier = args[0].ToString();
+                int reserve = int.Parse(args[1].ToString());
+                if (reserve <= 0 || reserve > 3) { Debug.WriteLine($"This command requires two arguments. <Steam> OR <License> AND <Reserved> (1, 2, or 3)"); return; }
+                Player player = Players.FirstOrDefault(k => k.Identifiers["license"] == identifier || k.Identifiers["steam"] == identifier);
+                if (player != null)
+                {
+                    ReservedAccount account = new ReservedAccount(player.Identifiers["license"], player.Identifiers["steam"], (Reserved)reserve);
+                    accounts.Add(account);
+                    if (!Server_Queue.reserved.TryAdd(account.License, account.Reserve))
+                    {
+                        Server_Queue.reserved.TryGetValue(account.License, out Reserved oldReserved);
+                        Server_Queue.reserved.TryUpdate(account.License, account.Reserve, oldReserved);
+                    }
+                    string path = $"{directory}/{account.License}-{account.Steam}.json";
+                    File.WriteAllText(path, JsonConvert.SerializeObject(account));
+                    Debug.WriteLine($"{identifier} was granted reserved slot.");
+                }
+                else
+                {
+                    Debug.WriteLine($"No account found in session for {identifier}, adding to offline reserve list");
+                    newwhitelist.Add(new ReservedAccount(identifier, identifier, (Reserved)reserve));
+                    string path = $"resources/{Server_Queue.resourceName}/JSON/offlinereserve.json";
+                    File.WriteAllText(path, JsonConvert.SerializeObject(newwhitelist));
+                }
+            }
+            catch (Exception)
+            {
+                Debug.WriteLine($"[{Server_Queue.resourceName} - ERROR] - Server_Reserved.Add()");
+            }
+            return;
+        }
+
+        internal static void Remove(int source, List<object> args, string raw)
+        {
+            try
+            {
+                if (args.Count != 1)
+                {
+                    Debug.WriteLine($"This command requires one argument. <Steam> OR <License>");
+                    return;
+                }
+                string identifier = args[0].ToString();
+                newwhitelist.Where(k => k.License == identifier || k.Steam == identifier).ToList().ForEach(j =>
+                {
+                    newwhitelist.Remove(j);
+                });
+                string path = $"resources/{Server_Queue.resourceName}/JSON/offlinereserve.json";
+                File.WriteAllText(path, JsonConvert.SerializeObject(newwhitelist));
+                accounts.Where(k => k.License == identifier || k.Steam == identifier).ToList().ForEach(j =>
+                {
+                    path = $"{directory}/{j.License}-{j.Steam}.json";
+                    File.Delete(path);
+                    accounts.Remove(j);
+                });
+                Server_Queue.reserved.TryRemove(identifier, out Reserved oldReserved);
+                Debug.WriteLine($"{identifier} was removed from reserved list.");
+            }
+            catch (Exception)
+            {
+                Debug.WriteLine($"[{Server_Queue.resourceName} - ERROR] - Server_Reserved.Remove()");
+            }
+            return;
+        }
+
+        internal static void AutoWhitelist(ReservedAccount account)
+        {
+            try
+            {
+                accounts.Add(account);
+                string path = $"{directory}/{account.License}-{account.Steam}.json";
+                File.WriteAllText(path, JsonConvert.SerializeObject(account));
+                newwhitelist.RemoveAll(k => k.License == account.License || k.Steam == account.Steam);
+                path = $"resources/{Server_Queue.resourceName}/JSON/offlinereserve.json";
+                File.WriteAllText(path, JsonConvert.SerializeObject(newwhitelist));
+                Debug.WriteLine($"{account.License}-{account.Steam} was auto reserved.");
+            }
+            catch (Exception)
+            {
+                Debug.WriteLine($"[{Server_Queue.resourceName} - ERROR] - Server_Reserved.AutoWhitelist()");
+            }
         }
     }
 
-    class Timer
+    class BannedAccount
     {
-        static DateTime StartTime;
-        static DateTime StopTime;
-        public int ElapsedTime { get; private set; }
+        public string License { get; set; }
+        public string Steam { get; set; }
 
-        public void Start()
+        public BannedAccount(string license, string steam)
         {
-            StartTime = DateTime.UtcNow;
+            License = license;
+            Steam = steam;
+        }
+    }
+
+    class Server_Banned : BaseScript
+    {
+        static readonly string directory = $"resources/{Server_Queue.resourceName}/JSON/Banned";
+        static List<FileInfo> files = new List<FileInfo>();
+        internal static List<BannedAccount> accounts = new List<BannedAccount>();
+        internal static List<BannedAccount> newblacklist = new List<BannedAccount>();
+
+        public Server_Banned()
+        {
+            try
+            {
+                if (!Directory.Exists(directory))
+                {
+                    Directory.CreateDirectory(directory);
+                }
+                DirectoryInfo di = new DirectoryInfo(directory);
+                files = di.GetFiles("*.json").ToList();
+                files.ForEach(k =>
+                {
+                    accounts.Add(JsonConvert.DeserializeObject<BannedAccount>(File.ReadAllText(k.FullName).ToString()));
+                });
+                if (File.Exists($"resources/{Server_Queue.resourceName}/JSON/offlinebans.json"))
+                {
+                    newblacklist = JsonConvert.DeserializeObject<List<BannedAccount>>(File.ReadAllText($"resources/{Server_Queue.resourceName}/JSON/offlinebans.json").ToString());
+                }
+                API.RegisterCommand("q_addban", new Action<int, List<object>, string>(Add), true);
+                API.RegisterCommand("q_removeban", new Action<int, List<object>, string>(Remove), true);
+                Server_Queue.bannedReady = true;
+            }
+            catch (Exception)
+            {
+                Debug.WriteLine($"[{Server_Queue.resourceName} - ERROR] - Server_Banned.Start()");
+            }
         }
 
-        public void Stop()
+        internal void Add(int source, List<object> args, string raw)
         {
-            StopTime = DateTime.UtcNow;
-            ElapsedTime = (StopTime - StartTime).Milliseconds;
+            try
+            {
+                if (args.Count != 1)
+                {
+                    Debug.WriteLine($"This command requires one argument. <Steam> OR <License>");
+                    return;
+                }
+                string identifier = args[0].ToString();
+                Player player = Players.FirstOrDefault(k => k.Identifiers["license"] == identifier || k.Identifiers["steam"] == identifier);
+                if (player != null)
+                {
+                    BannedAccount account = new BannedAccount(player.Identifiers["license"], player.Identifiers["steam"]);
+                    accounts.Add(account);
+                    string path = $"{directory}/{account.License}-{account.Steam}.json";
+                    File.WriteAllText(path, JsonConvert.SerializeObject(account));
+                    Debug.WriteLine($"{identifier} was banned.");
+                    API.ExecuteCommand($"q_kick {identifier}");
+                }
+                else
+                {
+                    Debug.WriteLine($"No account found in session for {identifier}, adding to offline ban list");
+                    newblacklist.Add(new BannedAccount(identifier, identifier));
+                    string path = $"resources/{Server_Queue.resourceName}/JSON/offlinebans.json";
+                    File.WriteAllText(path, JsonConvert.SerializeObject(newblacklist));
+                }
+            }
+            catch (Exception)
+            {
+                Debug.WriteLine($"[{Server_Queue.resourceName} - ERROR] - Server_Banned.Add()");
+            }
+            return;
         }
 
+        internal static void Remove(int source, List<object> args, string raw)
+        {
+            try
+            {
+                if (args.Count != 1)
+                {
+                    Debug.WriteLine($"This command requires one argument. <Steam> OR <License>");
+                    return;
+                }
+                string identifier = args[0].ToString();
+                newblacklist.Where(k => k.License == identifier || k.Steam == identifier).ToList().ForEach(j =>
+                {
+                    newblacklist.Remove(j);
+                });
+                string path = $"resources/{Server_Queue.resourceName}/JSON/offlinebans.json";
+                File.WriteAllText(path, JsonConvert.SerializeObject(newblacklist));
+                accounts.Where(k => k.License == identifier || k.Steam == identifier).ToList().ForEach(j =>
+                {
+                    path = $"{directory}/{j.License}-{j.Steam}.json";
+                    File.Delete(path);
+                    accounts.Remove(j);
+                });
+                Debug.WriteLine($"{identifier} was removed from banned list.");
+            }
+            catch (Exception)
+            {
+                Debug.WriteLine($"[{Server_Queue.resourceName} - ERROR] - Server_Banned.Remove()");
+            }
+            return;
+        }
+
+        internal static void AutoBlacklist(BannedAccount account)
+        {
+            try
+            {
+                accounts.Add(account);
+                string path = $"{directory}/{account.License}-{account.Steam}.json";
+                File.WriteAllText(path, JsonConvert.SerializeObject(account));
+                newblacklist.RemoveAll(k => k.License == account.License || k.Steam == account.Steam);
+                path = $"resources/{Server_Queue.resourceName}/JSON/offlinebans.json";
+                File.WriteAllText(path, JsonConvert.SerializeObject(newblacklist));
+                Debug.WriteLine($"{account.License}-{account.Steam} was auto banned.");
+            }
+            catch (Exception)
+            {
+                Debug.WriteLine($"[{Server_Queue.resourceName} - ERROR] - Server_Reserved.AutoBlacklist()");
+            }
+        }
     }
 
     enum SessionState
     {
         Queue,
-        QueueGrace,
-        Banned,
-        Exiting,
         Grace,
         Loading,
-        Active
+        Active,
     }
 
     enum Reserved
     {
-        Public,
-        Reserved1,
+        Reserved1 = 1,
         Reserved2,
-        Reserved3
+        Reserved3,
+        Public
     }
 }

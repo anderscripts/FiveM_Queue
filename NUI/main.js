@@ -1,13 +1,26 @@
+var resname;
+
+function noenter() 
+{
+  return !(window.event && window.event.keyCode == 13);
+}
+
+function handleChange(input) 
+{
+	if (input.value <= 0) input.value = 1;
+	if (input.value > 100) input.value = 100;
+}
+
 function ClosePanel()
 {
 	var obj = { message: 'closing panel' };
-	$.post('http://fivemqueue/ClosePanel', JSON.stringify(obj));
+	$.post('http://'+resname+'/ClosePanel', JSON.stringify(obj));
 }
 
 function RefreshPanel()
 {
 	var obj = { message: 'refreshing panel' };
-	$.post('http://fivemqueue/RefreshPanel', JSON.stringify(obj));
+	$.post('http://'+resname+'/RefreshPanel', JSON.stringify(obj));
 }
 
 function BackPanel()
@@ -17,45 +30,49 @@ function BackPanel()
 	return;
 }
 
-function Change(steam)
+function Change(license)
 {
-	var obj = { Steam: steam }
+	var obj = { License: license }
 	var buf = $('#edit');
 	$('#panel').hide();
 	document.getElementById("options").innerHTML = "";
-	buf.find('table').append("<tr class=\"heading\"><th>Reserved Slot Setting</th><th>Priority Setting</th><th>Kick or Ban</th></tr><tr><td><button class=\"button\" onclick=ChangeReserved('" + steam + "','" + 0 + "')>Public</button><button class=\"button\" onclick=ChangeReserved('" + steam + "','" + 1 + "')>Reserved 1</button><button class=\"button\" onclick=ChangeReserved('" + steam + "','" + 2 + "')>Reserved 2</button><button class=\"button\" onclick=ChangeReserved('" + steam + "','" + 3 + "')>Reserved 3</button></td><td><button class=\"button\" onclick=ChangePriority('" + steam + "','True')>Add</button><button class=\"button\" onclick=ChangePriority('" + steam + "','False')>Remove</button></td><td><button class=\"button\" onclick=BanUser('" + steam + "')>Ban User</button><button class=\"button\" onclick=KickUser('" + steam + "')>Kick User</button></td></tr>");
+	buf.find('table').append("<tr class=\"heading\"><th>Reserved Slot Setting</th><th>Priority Setting</th><th>Kick or Ban</th></tr><tr><td><button class=\"button\" onclick=ChangeReserved('" + license + "','" + 0 + "')>Public</button><button class=\"button\" onclick=ChangeReserved('" + license + "','" + 1 + "')>Reserved 1</button><button class=\"button\" onclick=ChangeReserved('" + license + "','" + 2 + "')>Reserved 2</button><button class=\"button\" onclick=ChangeReserved('" + license + "','" + 3 + "')>Reserved 3</button></td><td><form><input type=\"number\" pattern=\"\d+\" id=\"priority\" placeholder=\"1 to 100\" onkeypress=\"return noenter()\" onchange=\"handleChange(this)\"></form><button class=\"button\" onclick=ChangePriority('" + license + "','True')>Add</button><button class=\"button\" onclick=ChangePriority('" + license + "','False')>Remove</button></td><td><button class=\"button\" onclick=BanUser('" + license + "')>Ban User</button><button class=\"button\" onclick=KickUser('" + license + "')>Kick User</button></td></tr>");
 	$('#edit').show();
 	return;
 }
 
-function BanUser(steam)
+function BanUser(license)
 {
-	var obj = { Steam: steam }
-	$.post('http://fivemqueue/BanUser', JSON.stringify(obj));
+	var obj = { License: license }
+	$.post('http://'+resname+'/BanUser', JSON.stringify(obj));
 	ClosePanel();
 	return;
 }
 
-function KickUser(steam)
+function KickUser(license)
 {
-	var obj = { Steam: steam }
-	$.post('http://fivemqueue/KickUser', JSON.stringify(obj));
+	var obj = { License: license }
+	$.post('http://'+resname+'/KickUser', JSON.stringify(obj));
 	ClosePanel();
 	return;
 }
 
-function ChangePriority(steam, value)
+function ChangePriority(license, change)
 {
-	var obj = { Steam: steam , Value: value}
-	$.post('http://fivemqueue/ChangePriority', JSON.stringify(obj));
+	if (change == 'True')
+	{
+		change = document.getElementById("priority").value;
+	}
+	var obj = { License: license , Value: change}
+	$.post('http://'+resname+'/ChangePriority', JSON.stringify(obj));
 	ClosePanel();
 	return;
 }
 
-function ChangeReserved(steam, value)
+function ChangeReserved(license, value)
 {
-	var obj = { Steam: steam , Value: value}
-	$.post('http://fivemqueue/ChangeReserved', JSON.stringify(obj));
+	var obj = { License: license , Value: value}
+	$.post('http://'+resname+'/ChangeReserved', JSON.stringify(obj));
 	ClosePanel();
 	return;
 }
@@ -66,6 +83,11 @@ $(function()
     {
         var item = event.data;
         var buf = $('#panel');
+		if (item.resname)
+		{
+			resname = item.resname;
+			return;
+		}
         if (item.panel && item.panel == 'close')
         {
             document.getElementById("list").innerHTML = "";

@@ -4,13 +4,14 @@
   <PropertyGroup>
     <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
     <Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
-    <ProjectGuid>{DD8151FC-0526-4811-BEEF-2D8C34BB4763}</ProjectGuid>
+    <ProjectGuid>{A0D85DA2-D419-46F8-9415-DD080F54AD5B}</ProjectGuid>
     <OutputType>Library</OutputType>
     <AppDesignerFolder>Properties</AppDesignerFolder>
     <RootNamespace>Server_Queue</RootNamespace>
     <AssemblyName>Server_Queue.net</AssemblyName>
     <TargetFrameworkVersion>v4.5.2</TargetFrameworkVersion>
     <FileAlignment>512</FileAlignment>
+    <Deterministic>true</Deterministic>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
     <DebugSymbols>true</DebugSymbols>
@@ -55,11 +56,17 @@
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </Content>
   </ItemGroup>
+  <ItemGroup>
+    <Content Include="__messages.json">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
   <PropertyGroup>
     <PostBuildEvent>mkdir  "%25FiveM_Resources%25\fivemqueue"
 copy /y "$(TargetPath)" "%25FiveM_Resources%25\fivemqueue"
 copy /y "Newtonsoft.Json.dll" "%25FiveM_Resources%25\fivemqueue"
-copy /y "__configuration.cfg" "%25FiveM_Resources%25\fivemqueue"</PostBuildEvent>
+copy /y "__configuration.cfg" "%25FiveM_Resources%25\fivemqueue"
+copy /y "__messages.json" "%25FiveM_Resources%25\fivemqueue"</PostBuildEvent>
   </PropertyGroup>
 </Project>

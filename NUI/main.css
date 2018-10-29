@@ -30,7 +30,7 @@ tr.heading {
 }
 
 tr {
-	font-size: 100%;
+	font-size: 80%;
 	font-family: 'Segoe UI';
     text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.9);
 }
@@ -43,12 +43,22 @@ td {
     background-color: #2980B9;
     border: none;
     color: white;
-    padding: 5px 5px;
+    padding: 2px 2px;
     text-align: center;
     text-decoration: none;
 	text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.9);
     display: inline-block;
-    font-size: 16px;
-    margin: 5px 5px;
+    font-size: 12px;
+    margin: 2px 2px;
     cursor: pointer;
+}
+
+input[type=number] {
+    width: 15%;
+    padding: 2px 2px;
+    margin: 2px 2px;
+    display: inline-block;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    box-sizing: border-box;
 }

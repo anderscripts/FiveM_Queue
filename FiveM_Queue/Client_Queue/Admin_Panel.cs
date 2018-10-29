@@ -1,8 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 using System.Dynamic;
 using CitizenFX.Core;
 using CitizenFX.Core.Native;
@@ -17,7 +15,7 @@ namespace Client_Queue
         public Admin_Panel()
         {
             EventHandlers["onResourceStop"] += new Action<string>(OnResourceStop);
-            EventHandlers["fivemqueue: sessionResponse"] += new Action<dynamic>(SessionResponse);
+            EventHandlers["fivemqueue: sessionResponse"] += new Action<ExpandoObject>(SessionResponse);
             API.RegisterNuiCallbackType("ClosePanel");
             EventHandlers["__cfx_nui:ClosePanel"] += new Action<ExpandoObject>(ClosePanel);
             API.RegisterNuiCallbackType("RefreshPanel");
@@ -52,21 +50,20 @@ namespace Client_Queue
         {
             try
             {
-                List<SessionAccount> sessionAccounts = JsonConvert.DeserializeObject<List<SessionAccount>>(session);
-                sessionAccounts = sessionAccounts.OrderBy(k => k.State == SessionState.Active).ThenBy(k => k.Handle).ToList();
+                List<dynamic> sessionAccounts = JsonConvert.DeserializeObject<List<dynamic>>(session);
                 string text = "";
                 sessionAccounts.ForEach(k =>
                 {
                     text = $"{text}<tr>" +
-                    $"<td>{k.Handle}</td>" +
-                    $"<td>{k.License}</td>" +
-                    $"<td>{k.Steam}</td>" +
-                    $"<td>{k.Name}</td>" +
-                    $"<td>{Enum.GetName(typeof(Reserved), k.ReservedType)}</td>" +
-                    $"<td>{Enum.GetName(typeof(Reserved), k.ReservedTypeUsed)}</td>" +
-                    $"<td>{k.HasPriority}</td>" +
-                    $"<td>{Enum.GetName(typeof(SessionState), k.State)}</td>" +
-                    $"<td><button class=button onclick=Change('{k.Steam}')>Change</button></td>" +
+                    $"<td>{k["Handle"]}</td>" +
+                    $"<td>{k["License"]}</td>" +
+                    $"<td>{k["Steam"]}</td>" +
+                    $"<td>{k["Name"]}</td>" +
+                    $"<td>{Enum.GetName(typeof(Reserved), (int)k["Reserved"])}</td>" +
+                    $"<td>{Enum.GetName(typeof(Reserved), (int)k["ReservedUsed"])}</td>" +
+                    $"<td>{k["Priority"]}</td>" +
+                    $"<td>{Enum.GetName(typeof(SessionState), (int)k["State"])}</td>" +
+                    $"<td><button class=button onclick=Change('{k["License"]}')>Change</button></td>" +
                     $"</tr>";
                 });
                 API.SendNuiMessage($@"{{ ""sessionlist"" : ""{text}"" }}");
@@ -109,7 +106,7 @@ namespace Client_Queue
         {
             try
             {
-                API.ExecuteCommand($"q_addban {data.Steam}");
+                API.ExecuteCommand($"q_addban {data.License}");
             }
             catch (Exception)
             {
@@ -121,7 +118,7 @@ namespace Client_Queue
         {
             try
             {
-                API.ExecuteCommand($"q_kick {data.Steam}");
+                API.ExecuteCommand($"q_kick {data.License}");
             }
             catch (Exception)
             {
@@ -133,14 +130,16 @@ namespace Client_Queue
         {
             try
             {
-                if (data.Value == "True")
+                if (data.Value == "False")
                 {
-                    API.ExecuteCommand($"q_addpriority {data.Steam}");
+                    API.ExecuteCommand($"q_removepriority {data.License}");
+                    return;
                 }
-                else if (data.Value == "False")
+                else
                 {
-                    API.ExecuteCommand($"q_removepriority {data.Steam}");
+                    API.ExecuteCommand($"q_addpriority {data.License} {int.Parse(data.Value.ToString())}");
                 }
+                
             }
             catch (Exception)
             {
@@ -155,11 +154,11 @@ namespace Client_Queue
                 int value = int.Parse(data.Value);
                 if (value == 0)
                 {
-                    API.ExecuteCommand($"q_removereserve {data.Steam}");
+                    API.ExecuteCommand($"q_removereserve {data.License}");
                 }
                 else
                 {
-                    API.ExecuteCommand($"q_addreserve {data.Steam} {value}");
+                    API.ExecuteCommand($"q_addreserve {data.License} {value}");
                 }
             }
             catch (Exception)
@@ -169,38 +168,9 @@ namespace Client_Queue
         }
     }
 
-    class SessionAccount
-    {
-        public string License { get; set; }
-        public string Steam { get; set; }
-        public string Name { get; set; }
-        public string Handle { get; set; }
-        public SessionState State { get; set; }
-        public DateTime QueueStartTime { get; set; }
-        public bool HasPriority { get; set; }
-        public Reserved ReservedType { get; set; }
-        public Reserved ReservedTypeUsed { get; set; }
-
-        public SessionAccount(string license, string steam, string name, string handle, SessionState state, DateTime queuestarttime, bool haspriority, Reserved reservedtype, Reserved reservedused)
-        {
-            License = license;
-            Steam = steam;
-            Name = name;
-            Handle = handle;
-            State = state;
-            QueueStartTime = queuestarttime;
-            HasPriority = haspriority;
-            ReservedType = reservedtype;
-            ReservedTypeUsed = reservedused;
-        }
-    }
-
     enum SessionState
     {
         Queue,
-        QueueGrace,
-        Banned,
-        Exiting,
         Grace,
         Loading,
         Active
@@ -208,9 +178,9 @@ namespace Client_Queue
 
     enum Reserved
     {
-        Public,
-        Reserved1,
+        Reserved1 = 1,
         Reserved2,
-        Reserved3
+        Reserved3,
+        Public
     }
 }
