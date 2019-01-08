@@ -76,7 +76,6 @@ namespace Server
             if (!File.Exists(path)) { CreateMessagesJSON(path); }
             else { messages = JsonConvert.DeserializeObject<Dictionary<string, string>>(File.ReadAllText(path)); }
             maxSession = API.GetConvarInt("q_max_session_slots", 32);
-            if (maxSession > 32) { maxSession = 32; }
             API.ExecuteCommand($"sv_maxclients {maxSession}");
             loadTime = API.GetConvarInt("q_loading_time_limit", 2);
             graceTime = API.GetConvarInt("q_reconnect_grace_time_limit", 2);
