@@ -200,14 +200,14 @@ namespace Server
                     editHost = true;
                     if (count > 0) { concat = string.Format($"{messages["QueueCount"]} {concat}", count); }
                     else { concat = hostName; }
-                    API.ExecuteCommand($"sets fivemqueuecpunt " + count);
+                    API.ExecuteCommand($"sets fivemqueuecount " + count);
                 }
                 if (API.GetConvar("q_add_queue_count_after_server_name", "false") == "true")
                 {
                     editHost = true;
                     if (count > 0) { concat = string.Format($"{concat} {messages["QueueCount"]}", count); }
                     else { concat = hostName; }
-                    API.ExecuteCommand($"sets fivemqueuecpunt " + count);
+                    API.ExecuteCommand($"sets fivemqueuecount " + count);
                 }
                 if (lastCount != count && editHost)
                 {
