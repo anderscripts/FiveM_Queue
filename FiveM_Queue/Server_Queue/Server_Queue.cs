@@ -703,10 +703,13 @@ namespace Server
                 {
                     return;
                 }
-                session.TryGetValue(license, out SessionState oldState);
-                session.TryUpdate(license, SessionState.Grace, oldState);
-                if (stateChangeMessages) { Debug.WriteLine($"[{resourceName}]: {Enum.GetName(typeof(SessionState), oldState).ToUpper()} -> GRACE -> {license}"); }
-                UpdateTimer(license);
+                bool hasState = session.TryGetValue(license, out SessionState oldState);
+                if (hasState && oldState != SessionState.Queue)
+                {
+                    session.TryUpdate(license, SessionState.Grace, oldState);
+                    if (stateChangeMessages) { Debug.WriteLine($"[{resourceName}]: {Enum.GetName(typeof(SessionState), oldState).ToUpper()} -> GRACE -> {license}"); }
+                    UpdateTimer(license);
+                }
             }
             catch (Exception)
             {
