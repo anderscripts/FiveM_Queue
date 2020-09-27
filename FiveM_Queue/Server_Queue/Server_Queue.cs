@@ -511,14 +511,6 @@ namespace Server
                                 UpdateTimer(license);
                                 if (stateChangeMessages) { Debug.WriteLine($"[{resourceName}]: LOADING -> GRACE -> {license}"); }
                             }
-                            else
-                            {
-                                if (sentLoading.ContainsKey(license) && Players.FirstOrDefault(i => i.Identifiers["license"] == license) != null)
-                                {
-                                    TriggerEvent("fivemqueue: newloading", sentLoading[license]);
-                                    sentLoading.TryRemove(license, out Player oldPlayer);
-                                }
-                            }
                             break;
                         case SessionState.Grace:
                             if (!timer.TryGetValue(license, out DateTime oldGraceTime))
